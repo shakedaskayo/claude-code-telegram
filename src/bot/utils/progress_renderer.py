@@ -31,7 +31,7 @@ import collections
 import time
 from typing import Any, Optional
 
-from .html_format import escape_html
+from .html_format import escape_html, markdown_to_telegram_html
 
 # How many characters of Claude's running text to show. Telegram caps each
 # message at 4096; we leave room for the ribbon and the prelude.
@@ -179,7 +179,14 @@ class ProgressRenderer:
             shown = body[-_TEXT_BUDGET:]
             if len(body) > _TEXT_BUDGET:
                 shown = "…" + shown
-            lines.append(f"<blockquote>{escape_html(shown)}</blockquote>")
+            # Render Claude's markdown (bold, code, lists, links) as Telegram
+            # HTML inside the blockquote so the user sees properly-formatted
+            # output rather than raw `**bold**` and ```fences```. Uses the
+            # upstream markdown_to_telegram_html helper which is already
+            # battle-tested by the rest of the bot.
+            lines.append(
+                f"<blockquote expandable>{markdown_to_telegram_html(shown)}</blockquote>"
+            )
         elif self._tools:
             lines.append("🔧 <b>Using tools…</b>")
 

@@ -54,6 +54,7 @@ class SessionTracker:
     chat: Any
     user_id: int
     workspace: Optional[str] = None
+    name: Optional[str] = None  # derived from first prompt
     started_at: float = field(default_factory=time.monotonic)
     state: State = "idle"
     detail: str = ""
@@ -65,6 +66,9 @@ class SessionTracker:
     message: Any = None  # the pinned telegram Message
     last_event_at: float = field(default_factory=time.monotonic)
     interrupt_event: Optional[asyncio.Event] = None
+    # Per-session todo message (persists across iterations).
+    todo_message: Any = None
+    todo_last_text: Optional[str] = None
 
     @property
     def iteration_count(self) -> int:
@@ -103,6 +107,9 @@ class SessionTracker:
     async def begin_iteration(self, prompt: str) -> None:
         """A new turn (follow-up message) is starting."""
         self._iteration_count = self.iteration_count + 1
+        # Derive a session name from the first message we ever see.
+        if self.name is None and prompt:
+            self.name = _shorten(prompt.strip(), 50)
         it = _Iteration(
             index=self._iteration_count,
             prompt_preview=_shorten(prompt, 80),
@@ -218,7 +225,14 @@ class SessionTracker:
         elapsed = int(time.monotonic() - self.started_at)
         ws = self.workspace or "—"
 
-        header = f"📌 <b>{_escape(ws)}</b> · session {_fmt_dur(elapsed)}"
+        # Header: session name (if known) + workspace + elapsed.
+        if self.name:
+            header = (
+                f"📌 <b>{_escape(self.name)}</b>\n"
+                f"<i>{_escape(ws)}</i> · {_fmt_dur(elapsed)}"
+            )
+        else:
+            header = f"📌 <b>{_escape(ws)}</b> · session {_fmt_dur(elapsed)}"
         line2_parts = [f"{emoji} <i>{self.state}</i>"]
         if self._iteration_count:
             line2_parts.append(f"iteration {self._iteration_count}")

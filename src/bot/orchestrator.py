@@ -908,13 +908,24 @@ class MessageOrchestrator:
         trackers = context.bot_data.get("task_trackers", {})
         tracker = trackers.get(tracker_user_id)
 
+        # If the tracker is missing the pin is stale (bot was restarted).
+        # Strip the buttons + flag it so the user isn't confused by silent
+        # failures on taps.
+        if tracker is None:
+            await cb.answer("This pin is from a previous session — start /new to refresh.")
+            try:
+                if cb.message is not None:
+                    await cb.message.edit_reply_markup(reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         if action == "expand":
             await cb.answer()
-            if tracker is not None:
-                try:
-                    await tracker.toggle_expanded()
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("Expand toggle failed", error=str(e))
+            try:
+                await tracker.toggle_expanded()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Expand toggle failed", error=str(e))
             return
 
         if action == "end":
@@ -1421,8 +1432,9 @@ class MessageOrchestrator:
         # Begin a new iteration for this turn.
         await tracker.begin_iteration(message_text)
 
-        # Per-turn TodoWrite renderer — created lazily when Claude first uses it.
-        todo_tracker = TodoTracker(chat=chat)
+        # Session-scoped TodoWrite renderer — message persists across
+        # iterations within the same session via SessionTracker.todo_message.
+        todo_tracker = TodoTracker(chat=chat, session=tracker)
 
         on_stream = self._make_stream_callback(
             verbose_level,

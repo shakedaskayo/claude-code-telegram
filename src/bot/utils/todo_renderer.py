@@ -17,31 +17,64 @@ from typing import Any, List, Optional
 
 @dataclass
 class TodoTracker:
-    """Owns the 📋 Tasks message for one turn."""
+    """Owns the 📋 Tasks message for one turn — or for a session when
+    backed by a SessionTracker (todo_message persists across iterations)."""
 
     chat: Any
+    session: Any = None  # optional SessionTracker
     message: Any = None
     last_text: Optional[str] = None
 
+    @property
+    def _stored_message(self) -> Any:
+        if self.session is not None:
+            return self.session.todo_message
+        return self.message
+
+    @_stored_message.setter
+    def _stored_message(self, value: Any) -> None:
+        if self.session is not None:
+            self.session.todo_message = value
+        else:
+            self.message = value
+
+    @property
+    def _stored_text(self) -> Optional[str]:
+        if self.session is not None:
+            return self.session.todo_last_text
+        return self.last_text
+
+    @_stored_text.setter
+    def _stored_text(self, value: Optional[str]) -> None:
+        if self.session is not None:
+            self.session.todo_last_text = value
+        else:
+            self.last_text = value
+
     async def update(self, todos: List[dict]) -> None:
-        """Render the todos and post or edit the message."""
+        """Render the todos and post or edit the message.
+
+        When a SessionTracker is attached, the message reference lives on
+        the session so the same '📋 Tasks' message is edited across all
+        iterations (the user keeps scrolling back to the same message
+        instead of accumulating a new one per turn)."""
         text = render_todos(todos)
         if not text:
             return
-        if self.message is None:
+        msg = self._stored_message
+        if msg is None:
             try:
-                self.message = await self.chat.send_message(
-                    text, parse_mode="HTML"
-                )
-                self.last_text = text
+                new_msg = await self.chat.send_message(text, parse_mode="HTML")
+                self._stored_message = new_msg
+                self._stored_text = text
             except Exception:  # noqa: BLE001
-                self.message = None
+                self._stored_message = None
             return
-        if text == self.last_text:
+        if text == self._stored_text:
             return
         try:
-            await self.message.edit_text(text, parse_mode="HTML")
-            self.last_text = text
+            await msg.edit_text(text, parse_mode="HTML")
+            self._stored_text = text
         except Exception:  # noqa: BLE001
             # Telegram says 'message not modified' or rate-limits — ignore.
             pass
