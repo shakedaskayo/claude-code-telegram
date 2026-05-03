@@ -358,6 +358,18 @@ async def handle_text_message(
         # MCP image collection via stream intercept
         mcp_images: list[ImageAttachment] = []
 
+        # Throttle progress edits to ~1/s. Telegram rate-limits editMessageText
+        # at that rate and the Claude SDK can emit many events per second; sending
+        # one edit per event causes bursty, delayed updates. The throttler buffers
+        # the latest text and flushes at most every min_interval_s.
+        # See src/bot/utils/stream_throttler.py for the rationale.
+        from src.bot.utils.stream_throttler import StreamThrottler
+        progress_throttler = StreamThrottler(
+            progress_msg,
+            min_interval_s=getattr(settings, "stream_flush_interval_s", 1.0),
+            parse_mode="HTML",
+        )
+
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
             # Intercept send_image_to_user MCP tool calls.
@@ -380,7 +392,7 @@ async def handle_text_message(
             try:
                 progress_text = await _format_progress_update(update_obj)
                 if progress_text:
-                    await progress_msg.edit_text(progress_text, parse_mode="HTML")
+                    await progress_throttler.update(progress_text)
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))
 
@@ -435,6 +447,13 @@ async def handle_text_message(
             formatted_messages = [
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
+
+        # Cancel any pending throttled edit before we delete the message —
+        # otherwise the throttler may try to edit a deleted message.
+        try:
+            await progress_throttler.flush()  # send the final state if any
+        except Exception:  # noqa: BLE001 - never let cleanup crash the handler
+            pass
 
         # Delete progress message
         await progress_msg.delete()

@@ -106,6 +106,15 @@ class Settings(BaseSettings):
         DEFAULT_CLAUDE_INACTIVITY_CHECK_INTERVAL_S,
         description="How often (seconds) the inactivity watcher polls.",
     )
+    stream_flush_interval_s: float = Field(
+        1.0,
+        description=(
+            "Minimum seconds between progress-message edits sent to Telegram. "
+            "Telegram throttles editMessageText at ~1/sec/chat — sending faster "
+            "causes bursty updates. The throttler buffers the latest text and "
+            "flushes at most once per interval."
+        ),
+    )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
     )
