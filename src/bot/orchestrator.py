@@ -1319,16 +1319,24 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image+caption send failed", error=str(img_err))
 
-        # Send text messages (skip if caption was already embedded in photos)
+        # Send text messages (skip if caption was already embedded in photos).
+        # Attach a quick-reply keyboard to the LAST message if it ends with a
+        # detectable yes/no question.
         if not caption_sent:
+            from .utils.quick_reply import detect_quick_replies
+            full_text = "\n".join(
+                m.text for m in formatted_messages if m.text
+            )
+            quick_kb = detect_quick_replies(full_text)
             for i, message in enumerate(formatted_messages):
                 if not message.text or not message.text.strip():
                     continue
+                is_last = i == len(formatted_messages) - 1
                 try:
                     await update.message.reply_text(
                         message.text,
                         parse_mode=message.parse_mode,
-                        reply_markup=None,  # No keyboards in agentic mode
+                        reply_markup=quick_kb if is_last else None,
                         reply_to_message_id=(
                             update.message.message_id if i == 0 else None
                         ),
