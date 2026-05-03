@@ -28,6 +28,7 @@ We use HTML mode and escape user content with ``html_format.escape_html``.
 from __future__ import annotations
 
 import collections
+import time
 from typing import Any, Optional
 
 from .html_format import escape_html
@@ -69,11 +70,24 @@ class ProgressRenderer:
         )
         # Last error to surface, if any.
         self._error: Optional[str] = None
+        # Heartbeat tracking: monotonic timestamps for "this turn started" and
+        # "we last got any signal". The heartbeat task uses these to decide
+        # when to force-render an updated elapsed counter even with no new
+        # stream events.
+        self._start_at: float = time.monotonic()
+        self._last_event_at: float = self._start_at
+        # Total tool invocations across the turn. _tools deque truncates so
+        # this counter doesn't.
+        self._total_tools: int = 0
 
     # ------------------------------------------------------------------ feed
 
     def feed(self, update_obj: Any) -> None:
         """Update internal state from a StreamUpdate."""
+        # Always touch the heartbeat clock so the periodic refresher knows
+        # whether the SDK is alive.
+        self._last_event_at = time.monotonic()
+
         t = getattr(update_obj, "type", None)
 
         if t == "system":
@@ -108,6 +122,7 @@ class ProgressRenderer:
                 self._tools.append(
                     _ToolEntry(name=name, summary=summary, tool_use_id=tc.get("id"))
                 )
+                self._total_tools += 1
 
         elif t == "tool_result":
             md = getattr(update_obj, "metadata", None) or {}
@@ -132,8 +147,12 @@ class ProgressRenderer:
         body = self._final_text if self._final_text is not None else self._running_text
         body = body.strip()
 
-        # Nothing useful to show yet?
+        # Nothing useful to show yet — but DO render an early heartbeat so the
+        # user sees something the moment the bot acknowledges them.
         if not body and not self._tools and not self._error and not self._init_label:
+            elapsed = self.elapsed_seconds()
+            if elapsed >= 1:
+                return f"⏳ <i>Starting up… ({_fmt_dur(elapsed)})</i>"
             return None
 
         lines: list[str] = []
@@ -150,8 +169,6 @@ class ProgressRenderer:
         if body:
             lines.append("🤖 <b>Claude is working…</b>")
             lines.append("")
-            # Show the tail of the running text — that's what's freshly
-            # streaming in. Wrap with HTML quote-style indent for readability.
             shown = body[-_TEXT_BUDGET:]
             if len(body) > _TEXT_BUDGET:
                 shown = "…" + shown
@@ -170,7 +187,27 @@ class ProgressRenderer:
             lines.append("")
             lines.append("<i>Recent:</i> " + " · ".join(ribbon_parts))
 
+        # Footer line: elapsed time + total tools. Always present so the user
+        # has a clear "still alive" signal that ticks every refresh.
+        elapsed = self.elapsed_seconds()
+        idle = self.idle_seconds()
+        footer_bits = [f"⏱ {_fmt_dur(elapsed)}"]
+        if self._total_tools:
+            footer_bits.append(f"🔧 {self._total_tools} tools")
+        if idle >= 4:
+            footer_bits.append(f"💤 idle {_fmt_dur(idle)}")
+        lines.append("")
+        lines.append(f"<i>{' · '.join(footer_bits)}</i>")
+
         return "\n".join(lines)
+
+    # --- heartbeat helpers ------------------------------------------------
+
+    def elapsed_seconds(self) -> int:
+        return int(time.monotonic() - self._start_at)
+
+    def idle_seconds(self) -> int:
+        return int(time.monotonic() - self._last_event_at)
 
     # --------------------------------------------------------------- helpers
 
@@ -221,3 +258,13 @@ def _truncate(s: str, n: int) -> str:
     if len(s) <= n:
         return s
     return s[: max(0, n - 1)] + "…"
+
+
+def _fmt_dur(seconds: int) -> str:
+    """Format a positive duration for the heartbeat footer."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    h, rem = divmod(seconds, 3600)
+    return f"{h}h {rem // 60}m"

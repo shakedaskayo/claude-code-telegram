@@ -424,6 +424,26 @@ async def handle_text_message(
             except Exception as e:
                 logger.warning("Failed to update progress message", error=str(e))
 
+        # Heartbeat: refresh the progress bubble periodically even when the
+        # SDK isn't emitting events. Without this, long tool runs (e.g. a 90s
+        # WebFetch) leave the bubble looking frozen and the user has no
+        # 'still alive' signal. We piggyback on the throttler so we never
+        # exceed Telegram's edit rate.
+        async def _heartbeat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(4)
+                    text = progress_renderer.render()
+                    if text:
+                        try:
+                            await progress_throttler.update(text)
+                        except Exception as hb_err:  # noqa: BLE001
+                            logger.debug("Heartbeat refresh skipped", error=str(hb_err))
+            except asyncio.CancelledError:
+                return
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
+
         # Run Claude command
         try:
             claude_response = await claude_integration.run_command(
@@ -475,6 +495,14 @@ async def handle_text_message(
             formatted_messages = [
                 FormattedMessage(_format_error_message(e), parse_mode="HTML")
             ]
+
+        # Stop the heartbeat refresher first so it can't race with the flush
+        # or attempt to edit a message we're about to delete.
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
 
         # Cancel any pending throttled edit before we delete the message —
         # otherwise the throttler may try to edit a deleted message.
