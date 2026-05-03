@@ -1108,20 +1108,32 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
-        # If the user has a pending plan-Modify reply, route this message there
-        # instead of starting a new Claude turn. /cancel aborts the modify.
+        # If the user has a pending plan-Modify or voice-Edit reply, route
+        # this message there instead of starting a new Claude turn.
+        # /cancel aborts.
         from .handlers.interactive import (
             clear_pending_modify,
+            clear_pending_voice_edit,
             deliver_plan_modify,
+            deliver_voice_edit,
             get_pending_modify_prompt_id,
+            get_pending_voice_edit_prompt_id,
         )
+        is_cancel = message_text.strip().lower() in ("/cancel", "cancel")
         if get_pending_modify_prompt_id(user_id):
-            if message_text.strip().lower() in ("/cancel", "cancel"):
+            if is_cancel:
                 clear_pending_modify(user_id)
                 await update.message.reply_text("Plan modify cancelled.")
                 return
             if await deliver_plan_modify(context, user_id, message_text):
-                return  # Modify routed; no new turn
+                return
+        if get_pending_voice_edit_prompt_id(user_id):
+            if is_cancel:
+                clear_pending_voice_edit(user_id)
+                await update.message.reply_text("Voice edit cancelled.")
+                return
+            if await deliver_voice_edit(context, user_id, message_text):
+                return
 
         logger.info(
             "Agentic text message",
@@ -1603,7 +1615,14 @@ class MessageOrchestrator:
     async def agentic_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Transcribe voice message -> Claude, minimal chrome."""
+        """Transcribe voice → echo confirm → on Send, run Claude.
+
+        Adds a confirmation layer between transcription and execution so the
+        user sees what was heard before sending it to Claude. Buttons:
+          ✓ Send to Claude  → proceed with the transcript
+          ✏ Edit            → reply with corrected text (replaces transcript)
+          ✗ Cancel          → drop the message
+        """
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
@@ -1615,31 +1634,90 @@ class MessageOrchestrator:
 
         chat = update.message.chat
         await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Transcribing...")
+        progress_msg = await update.message.reply_text("🎤 Transcribing…")
 
         try:
             voice = update.message.voice
             processed_voice = await voice_handler.process_voice_message(
                 voice, update.message.caption
             )
+            transcript = processed_voice.prompt or ""
+        except Exception as e:
+            from .handlers.message import _format_error_message
+            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            logger.error(
+                "Voice transcription failed", error=str(e), user_id=user_id
+            )
+            return
 
-            await progress_msg.edit_text("Working...")
+        if not transcript.strip():
+            await progress_msg.edit_text("🎤 (couldn't make out any speech)")
+            return
+
+        # Skip the confirm step entirely if disabled by config — useful for
+        # users who prefer one-shot voice input.
+        if not getattr(self.settings, "voice_confirm_before_send", True):
+            await progress_msg.edit_text("Working…")
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,
-                prompt=processed_voice.prompt,
+                prompt=transcript,
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
             )
+            return
 
-        except Exception as e:
-            from .handlers.message import _format_error_message
+        # Register a pending voice prompt and post the confirmation buttons.
+        from .interactive import (
+            build_voice_keyboard,
+            get_or_create_registry,
+            render_voice_text,
+        )
+        registry = get_or_create_registry(context.bot_data)
+        prompt_id, future = await registry.register(
+            user_id=user_id,
+            chat_id=chat.id,
+            kind="voice",
+            tool_input={"transcript": transcript},
+        )
+        prompt = await registry.get(prompt_id)
+        if prompt is None:
+            await progress_msg.edit_text("internal error")
+            return
 
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
-            logger.error(
-                "Claude voice processing failed", error=str(e), user_id=user_id
+        try:
+            await progress_msg.edit_text(
+                render_voice_text(transcript),
+                parse_mode="HTML",
+                reply_markup=build_voice_keyboard(prompt_id),
             )
+            prompt.prompt_message = progress_msg
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to post voice confirm", error=str(e))
+            await registry.pop(prompt_id)
+            return
+
+        # Wait for the user's choice. The voice callback handler resolves
+        # the future with either {"send": <text>} or None (cancelled).
+        result = await future
+        if not result or "send" not in result:
+            return  # cancelled or timed out
+        final_prompt = result["send"]
+
+        # Reuse the message as a progress bubble for the Claude turn.
+        try:
+            await progress_msg.edit_text("Working…", reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await self._handle_agentic_media_message(
+            update=update,
+            context=context,
+            prompt=final_prompt,
+            progress_msg=progress_msg,
+            user_id=user_id,
+            chat=chat,
+        )
 
     async def _handle_agentic_media_message(
         self,

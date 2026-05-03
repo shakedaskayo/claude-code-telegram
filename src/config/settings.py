@@ -116,6 +116,14 @@ class Settings(BaseSettings):
             "actually exceeding limits in practice."
         ),
     )
+    voice_confirm_before_send: bool = Field(
+        True,
+        description=(
+            "When True, voice messages are transcribed and shown back to the "
+            "user with [Send] [Edit] [Cancel] buttons before being sent to "
+            "Claude. Set False to revert to one-shot voice → Claude."
+        ),
+    )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"
     )

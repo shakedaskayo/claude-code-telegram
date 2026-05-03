@@ -36,7 +36,10 @@ async def handle_interactive_callback(
         await _handle_ask_callback(update, context, data)
     elif data.startswith("plan:"):
         await _handle_plan_callback(update, context, data)
-    # voice / quick added in later commits
+    elif data.startswith("voice:"):
+        await _handle_voice_callback(update, context, data)
+    elif data.startswith("quick:"):
+        await _handle_quick_callback(update, context, data)
 
 
 # --------------------------------------------------------------- ask handler
@@ -346,3 +349,151 @@ async def _handle_plan_callback(
         return
 
     await cb.answer("unknown action")
+
+
+# ----------------------------------------------------------- voice handler
+
+# user_id -> prompt_id awaiting an edit-text reply for a voice transcript.
+_PENDING_VOICE_EDIT: Dict[int, str] = {}
+
+
+def get_pending_voice_edit_prompt_id(user_id: int) -> Optional[str]:
+    return _PENDING_VOICE_EDIT.get(user_id)
+
+
+def clear_pending_voice_edit(user_id: int) -> None:
+    _PENDING_VOICE_EDIT.pop(user_id, None)
+
+
+async def deliver_voice_edit(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    new_text: str,
+) -> bool:
+    """Route a free-text reply as the corrected transcript."""
+    prompt_id = _PENDING_VOICE_EDIT.pop(user_id, None)
+    if prompt_id is None:
+        return False
+    registry = get_registry(context)
+    prompt = await registry.pop(prompt_id)
+    if prompt is None or prompt.future.done():
+        return False
+    if not prompt.future.done():
+        prompt.future.set_result({"send": new_text})
+    if prompt.prompt_message is not None:
+        try:
+            await prompt.prompt_message.edit_text(
+                "🎤 <b>Sending edited transcript:</b>\n\n"
+                f"<blockquote>{_short(new_text)}</blockquote>",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to edit voice-edit message", error=str(e))
+    return True
+
+
+async def _handle_voice_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+) -> None:
+    """Process Send / Edit / Cancel taps for a voice transcript."""
+    cb = update.callback_query
+    if cb is None:
+        return
+    parts = data.split(":")
+    if len(parts) != 3:
+        await cb.answer("malformed callback")
+        return
+    _, prompt_id, action = parts
+
+    registry = get_registry(context)
+    prompt = await registry.get(prompt_id)
+    if prompt is None or prompt.future.done():
+        await cb.answer("Already handled.")
+        return
+    if cb.from_user is None or cb.from_user.id != prompt.user_id:
+        await cb.answer("Not your prompt.")
+        return
+
+    transcript: str = prompt.tool_input.get("transcript") or ""
+
+    if action == "send":
+        await registry.pop(prompt_id)
+        if not prompt.future.done():
+            prompt.future.set_result({"send": transcript})
+        await cb.answer("Sending")
+        return
+
+    if action == "cancel":
+        await registry.pop(prompt_id)
+        if not prompt.future.done():
+            prompt.future.set_result(None)
+        await cb.answer("Cancelled")
+        if prompt.prompt_message is not None:
+            try:
+                await prompt.prompt_message.edit_text(
+                    "🎤 <i>Cancelled.</i>",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to ack voice cancel", error=str(e))
+        return
+
+    if action == "edit":
+        _PENDING_VOICE_EDIT[prompt.user_id] = prompt_id
+        await cb.answer("Reply with the corrected text")
+        if prompt.prompt_message is not None:
+            try:
+                await prompt.prompt_message.edit_reply_markup(reply_markup=None)
+                await prompt.prompt_message.reply_text(
+                    "✏ <b>Edit transcript</b> — reply with the corrected text.\n"
+                    "<i>(or send /cancel to abort)</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to ack voice edit", error=str(e))
+        return
+
+    await cb.answer("unknown action")
+
+
+# ----------------------------------------------------------- quick-reply
+
+async def _handle_quick_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
+) -> None:
+    """Click on a quick-reply shortcut: send the chosen reply as a new message.
+
+    Wired up by Commit 4. The callback_data carries the literal reply text,
+    e.g. ``quick:yes`` or ``quick:no``. We replay it as if the user typed it.
+    """
+    cb = update.callback_query
+    if cb is None or cb.data is None:
+        return
+    parts = cb.data.split(":", 1)
+    if len(parts) != 2:
+        await cb.answer("malformed callback")
+        return
+    payload = parts[1]
+    # Map short codes to full replies.
+    reply_text = {
+        "yes": "Yes",
+        "no": "No",
+        "more": "Tell me more",
+    }.get(payload, payload)
+    await cb.answer()
+    # Strip the keyboard from the message that was clicked.
+    try:
+        if cb.message is not None:
+            await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    # Send as a new message so the rest of the bot's pipeline picks it up
+    # like a real user message.
+    chat = cb.message.chat if cb.message else None
+    if chat is not None:
+        try:
+            await chat.send_message(reply_text)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("quick-reply send failed", error=str(e))

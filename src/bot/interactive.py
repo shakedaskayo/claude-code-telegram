@@ -283,6 +283,31 @@ def render_plan_text(plan: str) -> str:
     )
 
 
+def render_voice_text(transcript: str) -> str:
+    body = _escape(transcript).strip()
+    return (
+        "🎤 <b>I heard:</b>\n\n"
+        f"<blockquote expandable>{body}</blockquote>\n"
+        "<i>Send to Claude, edit the text, or cancel.</i>"
+    )
+
+
+def build_voice_keyboard(prompt_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✓ Send", callback_data=f"voice:{prompt_id}:send"
+            ),
+            InlineKeyboardButton(
+                "✏ Edit", callback_data=f"voice:{prompt_id}:edit"
+            ),
+            InlineKeyboardButton(
+                "✗ Cancel", callback_data=f"voice:{prompt_id}:cancel"
+            ),
+        ]
+    ])
+
+
 def build_plan_keyboard(prompt_id: str) -> InlineKeyboardMarkup:
     """Three-button keyboard for plan approval.
 
