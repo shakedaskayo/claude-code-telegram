@@ -44,10 +44,14 @@ class StreamThrottler:
         *,
         min_interval_s: float = 1.0,
         parse_mode: str = "HTML",
+        reply_markup: Any = None,
     ) -> None:
         self._message = message
         self._min_interval_s = min_interval_s
         self._parse_mode = parse_mode
+        # Persist the inline keyboard (e.g. Stop button) across throttled edits.
+        # Telegram's edit_text replaces the markup if not re-sent each time.
+        self._reply_markup = reply_markup
 
         self._pending_text: Optional[str] = None
         self._last_sent_text: Optional[str] = None
@@ -113,7 +117,10 @@ class StreamThrottler:
         if text is None or text == self._last_sent_text:
             return
         try:
-            await self._message.edit_text(text, parse_mode=self._parse_mode)
+            kwargs: dict = {"parse_mode": self._parse_mode}
+            if self._reply_markup is not None:
+                kwargs["reply_markup"] = self._reply_markup
+            await self._message.edit_text(text, **kwargs)
             self._last_sent_text = text
             self._last_sent_at = time.monotonic()
             self._backoff = 1.0

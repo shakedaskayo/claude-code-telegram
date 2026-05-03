@@ -713,6 +713,39 @@ class MessageOrchestrator:
 
         return asyncio.create_task(_heartbeat())
 
+    @staticmethod
+    def _start_progress_heartbeat(
+        progress_msg: Any,
+        interval: float = 4.0,
+    ) -> "asyncio.Task[None]":
+        """Refresh the progress bubble even when no stream events arrive.
+
+        Reads ``progress_msg._renderer`` and ``progress_msg._throttler`` set
+        by ``_make_stream_callback``. If either attribute is missing
+        (verbose=0, draft mode, etc.) the task does nothing and exits cleanly.
+        Without this, long tool runs (e.g. 90s WebFetch) leave the bubble
+        looking frozen and the user has no 'still alive' signal.
+        """
+
+        async def _heartbeat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    renderer = getattr(progress_msg, "_renderer", None)
+                    throttler = getattr(progress_msg, "_throttler", None)
+                    if renderer is None or throttler is None:
+                        return
+                    try:
+                        text = renderer.render()
+                        if text:
+                            await throttler.update(text)
+                    except Exception:  # noqa: BLE001 - never let this crash
+                        pass
+            except asyncio.CancelledError:
+                pass
+
+        return asyncio.create_task(_heartbeat())
+
     def _make_stream_callback(
         self,
         verbose_level: int,
@@ -744,7 +777,29 @@ class MessageOrchestrator:
         if verbose_level == 0 and not need_mcp_intercept and draft_streamer is None:
             return None
 
-        last_edit_time = [0.0]  # mutable container for closure
+        # Stateful progress renderer + Telegram-rate throttler. Replaces the
+        # old activity-log + 2.0s edit cadence with a unified pipeline that
+        # streams Claude's prose tokens (so the user sees writing happen),
+        # shows a tool ribbon with success/fail icons, and ticks an
+        # elapsed-time footer for clear 'still alive' signal.
+        from .utils.progress_renderer import ProgressRenderer
+        from .utils.stream_throttler import StreamThrottler
+
+        renderer = ProgressRenderer()
+        flush_interval = getattr(self.settings, "stream_flush_interval_s", 0.4)
+        throttler = StreamThrottler(
+            progress_msg,
+            min_interval_s=flush_interval,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        # Stash on progress_msg so the caller can access them for cleanup +
+        # heartbeat without us needing to thread them through return values.
+        try:
+            progress_msg._renderer = renderer
+            progress_msg._throttler = throttler
+        except Exception:  # noqa: BLE001 - never let bookkeeping crash the stream
+            pass
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
             # Stop all streaming activity after interrupt
@@ -806,20 +861,20 @@ class MessageOrchestrator:
                 if update_obj.type == "stream_delta":
                     await draft_streamer.append_text(update_obj.content)
 
-            # Throttle progress message edits to avoid Telegram rate limits
+            # Feed the renderer regardless of draft_streamer so the in-flight
+            # progress message gets the rich treatment. The renderer is
+            # idempotent and handles every event type.
             if not draft_streamer and verbose_level >= 1:
-                now = time.time()
-                if (now - last_edit_time[0]) >= 2.0 and tool_log:
-                    last_edit_time[0] = now
-                    new_text = self._format_verbose_progress(
-                        tool_log, verbose_level, start_time
+                try:
+                    renderer.feed(update_obj)
+                    text = renderer.render()
+                    if text:
+                        await throttler.update(text)
+                except Exception as render_err:  # noqa: BLE001
+                    logger.debug(
+                        "Progress render skipped",
+                        error=str(render_err),
                     )
-                    try:
-                        await progress_msg.edit_text(
-                            new_text, reply_markup=reply_markup
-                        )
-                    except Exception:
-                        pass
 
         return _on_stream
 
@@ -1003,6 +1058,7 @@ class MessageOrchestrator:
 
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
+        progress_heartbeat = self._start_progress_heartbeat(progress_msg)
 
         success = True
         try:
@@ -1067,6 +1123,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
+            progress_heartbeat.cancel()
             self._active_requests.pop(user_id, None)
             if draft_streamer:
                 try:
@@ -1256,6 +1313,7 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+        progress_heartbeat = self._start_progress_heartbeat(progress_msg)
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1337,6 +1395,7 @@ class MessageOrchestrator:
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            progress_heartbeat.cancel()
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1465,6 +1524,7 @@ class MessageOrchestrator:
         )
 
         heartbeat = self._start_typing_heartbeat(chat)
+        progress_heartbeat = self._start_progress_heartbeat(progress_msg)
         try:
             claude_response = await claude_integration.run_command(
                 prompt=prompt,
@@ -1477,6 +1537,7 @@ class MessageOrchestrator:
             )
         finally:
             heartbeat.cancel()
+            progress_heartbeat.cancel()
 
         if force_new:
             context.user_data["force_new_session"] = False
