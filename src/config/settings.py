@@ -107,12 +107,13 @@ class Settings(BaseSettings):
         description="How often (seconds) the inactivity watcher polls.",
     )
     stream_flush_interval_s: float = Field(
-        1.0,
+        0.4,
         description=(
             "Minimum seconds between progress-message edits sent to Telegram. "
-            "Telegram throttles editMessageText at ~1/sec/chat — sending faster "
-            "causes bursty updates. The throttler buffers the latest text and "
-            "flushes at most once per interval."
+            "Telegram rate-limits editMessageText around 1/sec/chat; the "
+            "throttler handles 429s gracefully so a sub-second interval gives "
+            "a more terminal-feel live stream of Claude's output without "
+            "actually exceeding limits in practice."
         ),
     )
     claude_max_cost_per_user: float = Field(

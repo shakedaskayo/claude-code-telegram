@@ -358,17 +358,17 @@ async def handle_text_message(
         # MCP image collection via stream intercept
         mcp_images: list[ImageAttachment] = []
 
-        # Throttle progress edits to ~1/s. Telegram rate-limits editMessageText
-        # at that rate and the Claude SDK can emit many events per second; sending
-        # one edit per event causes bursty, delayed updates. The throttler buffers
-        # the latest text and flushes at most every min_interval_s.
-        # See src/bot/utils/stream_throttler.py for the rationale.
+        # Throttle progress edits to ~0.4s. Telegram rate-limits editMessageText
+        # around 1/sec/chat; the throttler handles 429s gracefully so we run a
+        # bit faster for a more terminal-feel stream.
+        from src.bot.utils.progress_renderer import ProgressRenderer
         from src.bot.utils.stream_throttler import StreamThrottler
         progress_throttler = StreamThrottler(
             progress_msg,
-            min_interval_s=getattr(settings, "stream_flush_interval_s", 1.0),
+            min_interval_s=getattr(settings, "stream_flush_interval_s", 0.4),
             parse_mode="HTML",
         )
+        progress_renderer = ProgressRenderer()
 
         # Track whether we've persisted the start-of-turn placeholder yet.
         # Once we get a session_id from the SDK we write a placeholder row to
@@ -415,7 +415,10 @@ async def handle_text_message(
                     )
 
             try:
-                progress_text = await _format_progress_update(update_obj)
+                # Feed the renderer first so it accumulates state across events
+                # (especially stream_delta tokens and tool result correlations).
+                progress_renderer.feed(update_obj)
+                progress_text = progress_renderer.render()
                 if progress_text:
                     await progress_throttler.update(progress_text)
             except Exception as e:
