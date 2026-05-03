@@ -972,7 +972,7 @@ class MessageOrchestrator:
                     f"• state: {tracker.state}",
                     f"• elapsed: {elapsed}s",
                     f"• idle: {idle}s",
-                    f"• tools: {tracker.tool_count}",
+                    f"• tools: {tracker.total_tools}",
                 ]
                 if tracker.detail:
                     lines.append(f"• current: <i>{tracker.detail[:200]}</i>")
@@ -1136,14 +1136,19 @@ class MessageOrchestrator:
                             f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
                         )
                         await draft_streamer.append_tool(line)
-                    # Drive the pinned task tracker — show what's running now
-                    # and bump the tool counter.
+                    # Drive the pinned session tracker — show what's running
+                    # now and bump the tool counter. bump_tools also bumps
+                    # last_event_at so the heartbeat doesn't flag 'stalled'.
                     if tracker is not None:
-                        tracker.tool_count += 1
+                        label = (
+                            f"{_tool_icon(name)} {name}"
+                            if not detail
+                            else f"{_tool_icon(name)} {name} {detail[:30]}"
+                        )
+                        tracker.bump_tools(1, label=label)
                         await tracker.transition(
                             "running",
                             detail=f"{name} {detail}".strip() if detail else name,
-                            tool_count=tracker.tool_count,
                         )
                     # TodoWrite has its own dedicated message — render it.
                     if todo_tracker is not None and name == "TodoWrite":
@@ -1183,6 +1188,11 @@ class MessageOrchestrator:
             if not draft_streamer and verbose_level >= 1:
                 try:
                     renderer.feed(update_obj)
+                    # Touch the tracker's heartbeat clock too — without
+                    # this, prose-only events (no tool calls) would leave
+                    # last_event_at stale and the pin would flag 'stalled'.
+                    if tracker is not None:
+                        tracker.bump_event()
                     text = renderer.render()
                     if text:
                         urgent = update_obj.type in ("tool_result", "system") or (

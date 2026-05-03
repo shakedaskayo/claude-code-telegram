@@ -69,6 +69,8 @@ class SessionTracker:
     # Per-session todo message (persists across iterations).
     todo_message: Any = None
     todo_last_text: Optional[str] = None
+    # Recent ribbon — last N tool calls / events for the at-a-glance pin.
+    recent: Deque[str] = field(default_factory=lambda: deque(maxlen=5))
 
     @property
     def iteration_count(self) -> int:
@@ -191,12 +193,14 @@ class SessionTracker:
             self.state = "stalled"
         await self._refresh()
 
-    def bump_tools(self, n: int = 1) -> None:
+    def bump_tools(self, n: int = 1, label: Optional[str] = None) -> None:
         it = self.current_iteration
         if it is not None:
             it.tools += n
         self.total_tools += n
         self.last_event_at = time.monotonic()
+        if label:
+            self.recent.append(label)
 
     def bump_event(self) -> None:
         """Mark that an event happened (used to keep stalled away)."""
@@ -244,10 +248,13 @@ class SessionTracker:
 
         lines = [header, line2]
 
-        # If currently working on something, show it.
+        # If currently working on something, show it + recent activity.
         if self.detail and self.state in ("running", "stalled", "awaiting"):
             lines.append("")
             lines.append(f"<i>Now:</i> {_escape(self.detail[:140])}")
+        if self.recent and self.state in ("running", "stalled", "awaiting"):
+            ribbon = " · ".join(_escape(s) for s in list(self.recent))
+            lines.append(f"<i>Recent:</i> {ribbon}")
 
         # Expanded iteration list — opt-in via the [Show iterations] toggle.
         if self.expanded and self.iterations:
