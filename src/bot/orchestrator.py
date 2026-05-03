@@ -423,6 +423,14 @@ class MessageOrchestrator:
             )
         )
 
+        # Pinned task tracker actions: trk:queue:<user> and trk:status:<user>.
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_tracker_callback),
+                pattern=r"^trk:",
+            )
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -754,6 +762,7 @@ class MessageOrchestrator:
         user_id: int,
         chat_id: int,
         chat: Any,
+        tracker: Optional[Any] = None,
     ) -> Callable[[str, Dict[str, Any]], Any]:
         """Build the SDK-side interactive_handler for this turn.
 
@@ -807,7 +816,19 @@ class MessageOrchestrator:
                     return None
 
                 # Block the SDK call until the user answers (or timeout fires).
+                if tracker is not None:
+                    try:
+                        await tracker.transition(
+                            "awaiting", detail="Question pending", send_notification=True
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 result = await future
+                if tracker is not None:
+                    try:
+                        await tracker.transition("running")
+                    except Exception:  # noqa: BLE001
+                        pass
                 return result
 
             if tool_name == "ExitPlanMode":
@@ -843,12 +864,119 @@ class MessageOrchestrator:
                     await registry.pop(prompt_id)
                     return None
 
+                if tracker is not None:
+                    try:
+                        await tracker.transition(
+                            "awaiting", detail="Plan pending approval",
+                            send_notification=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 result = await future
+                if tracker is not None:
+                    try:
+                        await tracker.transition("running")
+                    except Exception:  # noqa: BLE001
+                        pass
                 return result
 
             return None
 
         return handler
+
+    async def _handle_tracker_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle taps on the pinned task tracker's [Queue] / [Status] buttons."""
+        cb = update.callback_query
+        if cb is None or cb.data is None:
+            return
+        parts = cb.data.split(":")
+        if len(parts) != 3 or parts[0] != "trk":
+            await cb.answer("malformed callback")
+            return
+        action, user_id_s = parts[1], parts[2]
+        try:
+            tracker_user_id = int(user_id_s)
+        except ValueError:
+            await cb.answer("malformed callback")
+            return
+        if cb.from_user is None or cb.from_user.id != tracker_user_id:
+            await cb.answer("Not your task.")
+            return
+
+        trackers = context.bot_data.get("task_trackers", {})
+        tracker = trackers.get(tracker_user_id)
+
+        if action == "queue":
+            from .task_tracker import mark_queue_pending
+            mark_queue_pending(tracker_user_id)
+            await cb.answer("Send your follow-up — it'll fire when this task ends")
+            try:
+                if cb.message is not None:
+                    await cb.message.reply_text(
+                        "📥 <b>Queue mode</b> — your next message will be held "
+                        "and sent automatically when the current task finishes.\n"
+                        "<i>(send /cancel to abort)</i>",
+                        parse_mode="HTML",
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        if action == "status":
+            await cb.answer()
+            if tracker is None:
+                try:
+                    if cb.message is not None:
+                        await cb.message.reply_text("No active task.")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            try:
+                import time as _t
+                idle = int(_t.monotonic() - tracker.last_event_at)
+                elapsed = int(_t.monotonic() - tracker.started_at)
+                lines = [
+                    f"ℹ <b>Task status</b>",
+                    f"• state: {tracker.state}",
+                    f"• elapsed: {elapsed}s",
+                    f"• idle: {idle}s",
+                    f"• tools: {tracker.tool_count}",
+                ]
+                if tracker.detail:
+                    lines.append(f"• current: <i>{tracker.detail[:200]}</i>")
+                if cb.message is not None:
+                    await cb.message.reply_text("\n".join(lines), parse_mode="HTML")
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Status reply failed", error=str(e))
+            return
+
+        await cb.answer("unknown action")
+
+    @staticmethod
+    def _start_tracker_heartbeat(
+        tracker: Any,
+        interval: float = 5.0,
+    ) -> "asyncio.Task[None]":
+        """Refresh the pinned task tracker every ``interval`` seconds.
+
+        Drives the running ↔ stalled transition based on ``last_event_at``
+        and keeps the elapsed counter advancing visibly.
+        """
+
+        async def _heartbeat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        await tracker.heartbeat_tick()
+                    except Exception:  # noqa: BLE001
+                        pass
+            except asyncio.CancelledError:
+                pass
+
+        return asyncio.create_task(_heartbeat())
 
     @staticmethod
     def _start_progress_heartbeat(
@@ -894,6 +1022,8 @@ class MessageOrchestrator:
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
         interrupt_event: Optional[asyncio.Event] = None,
+        tracker: Optional[Any] = None,
+        todo_tracker: Optional[Any] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -976,6 +1106,23 @@ class MessageOrchestrator:
                             f"{icon} {name}: {detail}" if detail else f"{icon} {name}"
                         )
                         await draft_streamer.append_tool(line)
+                    # Drive the pinned task tracker — show what's running now
+                    # and bump the tool counter.
+                    if tracker is not None:
+                        tracker.tool_count += 1
+                        await tracker.transition(
+                            "running",
+                            detail=f"{name} {detail}".strip() if detail else name,
+                            tool_count=tracker.tool_count,
+                        )
+                    # TodoWrite has its own dedicated message — render it.
+                    if todo_tracker is not None and name == "TodoWrite":
+                        todos = tc.get("input", {}).get("todos") or []
+                        if isinstance(todos, list):
+                            try:
+                                await todo_tracker.update(todos)
+                            except Exception:  # noqa: BLE001
+                                pass
 
             # Capture assistant text (reasoning / commentary)
             if update_obj.type == "assistant" and update_obj.content:
@@ -1116,8 +1263,8 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
-        # If the user has a pending plan-Modify or voice-Edit reply, route
-        # this message there instead of starting a new Claude turn.
+        # If the user has a pending plan-Modify, voice-Edit, or queue-pending
+        # reply, route this message there instead of starting a new turn.
         # /cancel aborts.
         from .handlers.interactive import (
             clear_pending_modify,
@@ -1127,7 +1274,23 @@ class MessageOrchestrator:
             get_pending_modify_prompt_id,
             get_pending_voice_edit_prompt_id,
         )
+        from .task_tracker import (
+            clear_queue_pending,
+            queue_pending,
+            store_queued_prompt,
+        )
         is_cancel = message_text.strip().lower() in ("/cancel", "cancel")
+        if queue_pending(user_id):
+            if is_cancel:
+                clear_queue_pending(user_id)
+                await update.message.reply_text("Queue cancelled.")
+                return
+            store_queued_prompt(user_id, message_text)
+            await update.message.reply_text(
+                "📥 <b>Queued</b> — will fire when the current task finishes.",
+                parse_mode="HTML",
+            )
+            return
         if get_pending_modify_prompt_id(user_id):
             if is_cancel:
                 clear_pending_modify(user_id)
@@ -1213,6 +1376,23 @@ class MessageOrchestrator:
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
+        # Pinned 'Active Task' tracker — survives long pauses, has actions.
+        from .task_tracker import TaskTracker
+        from .utils.todo_renderer import TodoTracker
+
+        workspace_name = current_dir.name if hasattr(current_dir, "name") else None
+        tracker = TaskTracker(
+            chat=chat,
+            user_id=user_id,
+            workspace=workspace_name,
+            interrupt_event=interrupt_event,
+        )
+        await tracker.start()
+        context.bot_data.setdefault("task_trackers", {})[user_id] = tracker
+
+        # Per-turn TodoWrite renderer — created lazily when Claude first uses it.
+        todo_tracker = TodoTracker(chat=chat)
+
         on_stream = self._make_stream_callback(
             verbose_level,
             progress_msg,
@@ -1223,11 +1403,14 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
             interrupt_event=interrupt_event,
+            tracker=tracker,
+            todo_tracker=todo_tracker,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
         heartbeat = self._start_typing_heartbeat(chat)
         progress_heartbeat = self._start_progress_heartbeat(progress_msg)
+        tracker_heartbeat = self._start_tracker_heartbeat(tracker)
 
         success = True
         try:
@@ -1240,7 +1423,7 @@ class MessageOrchestrator:
                 force_new=force_new,
                 interrupt_event=interrupt_event,
                 interactive_handler=self._make_interactive_handler(
-                    context, user_id, chat.id, chat
+                    context, user_id, chat.id, chat, tracker=tracker,
                 ),
             )
 
@@ -1296,12 +1479,46 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
             progress_heartbeat.cancel()
+            try:
+                tracker_heartbeat.cancel()
+            except Exception:  # noqa: BLE001
+                pass
             self._active_requests.pop(user_id, None)
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
                 except Exception:
                     logger.debug("Draft flush failed in finally block", user_id=user_id)
+            # Mark the pinned tracker done (success or failure based on flag).
+            try:
+                await tracker.finish(success=success)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Tracker finish failed", error=str(e))
+            # Drop reference so the next turn's tracker replaces this one.
+            try:
+                context.bot_data.get("task_trackers", {}).pop(user_id, None)
+            except Exception:  # noqa: BLE001
+                pass
+            # If the user queued a follow-up while this turn was running,
+            # ping them with the text and a Run button so they can fire it
+            # with one tap. (We can't synthesize an incoming Telegram update
+            # cleanly, so we surface the queued content for explicit re-send.)
+            try:
+                from .task_tracker import take_queued_prompt
+                queued = take_queued_prompt(user_id)
+                if queued:
+                    preview = queued[:300]
+                    asyncio.create_task(
+                        chat.send_message(
+                            (
+                                "📤 <b>Queued prompt ready</b> — tap to send:\n\n"
+                                f"<blockquote>{preview}</blockquote>"
+                            ),
+                            parse_mode="HTML",
+                        )
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Queued prompt delivery failed", error=str(e))
 
         try:
             await progress_msg.delete()
