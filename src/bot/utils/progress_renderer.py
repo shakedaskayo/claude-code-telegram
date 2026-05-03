@@ -167,7 +167,7 @@ class ProgressRenderer:
             lines.append(f"<i>{escape_html(self._init_label)}</i>")
 
         if body:
-            lines.append("🤖 <b>Claude is working…</b>")
+            lines.append("🐷 <b>Agent is working…</b>")
             lines.append("")
             shown = body[-_TEXT_BUDGET:]
             if len(body) > _TEXT_BUDGET:
@@ -178,12 +178,30 @@ class ProgressRenderer:
 
         if self._tools:
             ribbon_parts: list[str] = []
+            # Coalesce consecutive identical entries (same icon+name+summary)
+            # into "label ×N" so the ribbon doesn't read "Edit foo · Edit foo"
+            # when Claude makes several quick edits to the same file.
+            run_label: Optional[str] = None
+            run_count = 0
             for entry in self._tools:
                 icon = self._status_icon(entry.status)
                 label = entry.name
                 if entry.summary:
                     label = f"{label}<code> {escape_html(entry.summary)}</code>"
-                ribbon_parts.append(f"{icon} {label}")
+                full = f"{icon} {label}"
+                if full == run_label:
+                    run_count += 1
+                else:
+                    if run_label is not None:
+                        ribbon_parts.append(
+                            f"{run_label} ×{run_count}" if run_count > 1 else run_label
+                        )
+                    run_label = full
+                    run_count = 1
+            if run_label is not None:
+                ribbon_parts.append(
+                    f"{run_label} ×{run_count}" if run_count > 1 else run_label
+                )
             lines.append("")
             lines.append("<i>Recent:</i> " + " · ".join(ribbon_parts))
 

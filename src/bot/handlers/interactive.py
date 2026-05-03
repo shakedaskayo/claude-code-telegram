@@ -180,7 +180,8 @@ async def _refresh_prompt_message(
             0,
         )
     text = render_ask_text(questions, qidx, prompt.selections)
-    keyboard = build_ask_keyboard(prompt.prompt_id, questions, prompt.selections)
+    answers = prompt.tool_input.get("answers") or {}
+    keyboard = build_ask_keyboard(prompt.prompt_id, questions, prompt.selections, answers)
     if prompt.prompt_message is not None:
         try:
             await prompt.prompt_message.edit_text(

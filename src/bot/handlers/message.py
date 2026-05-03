@@ -49,7 +49,7 @@ async def _format_progress_update(update_obj) -> Optional[str]:
 
     elif update_obj.type == "progress":
         # Handle progress updates
-        progress_text = f"🔄 <b>{update_obj.content or 'Working...'}</b>"
+        progress_text = f"🔄 <b>{update_obj.content or '🐷 Agent is working…'}</b>"
 
         percentage = update_obj.get_progress_percentage()
         if percentage is not None:
@@ -84,7 +84,7 @@ async def _format_progress_update(update_obj) -> Optional[str]:
             if len(update_obj.content) > 150
             else update_obj.content
         )
-        return f"🤖 <b>Claude is working...</b>\n\n<i>{content_preview}</i>"
+        return f"🐷 <b>Agent is working…</b>\n\n<i>{content_preview}</i>"
 
     elif update_obj.type == "system":
         # System initialization or other system messages

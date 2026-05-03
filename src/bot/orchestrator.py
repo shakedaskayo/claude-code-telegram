@@ -665,10 +665,10 @@ class MessageOrchestrator:
     ) -> str:
         """Build the progress message text based on activity so far."""
         if not activity_log:
-            return "Working..."
+            return "🐷 Agent is working…"
 
         elapsed = time.time() - start_time
-        lines: List[str] = [f"Working... ({elapsed:.0f}s)\n"]
+        lines: List[str] = [f"🐷 Agent is working… ({elapsed:.0f}s)\n"]
 
         for entry in activity_log[-15:]:  # Show last 15 entries max
             kind = entry.get("kind", "tool")
@@ -791,7 +791,10 @@ class MessageOrchestrator:
                 prompt = await registry.get(prompt_id)
                 if prompt is None:
                     return {}
-                keyboard = build_ask_keyboard(prompt_id, questions, prompt.selections)
+                keyboard = build_ask_keyboard(
+                    prompt_id, questions, prompt.selections,
+                    prompt.tool_input.get("answers") or {},
+                )
 
                 try:
                     msg = await chat.send_message(
@@ -1160,7 +1163,7 @@ class MessageOrchestrator:
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
         progress_msg = await update.message.reply_text(
-            "Working...", reply_markup=stop_kb
+            "🐷 Agent is working…", reply_markup=stop_kb
         )
 
         # Register active request for stop callback
@@ -1419,7 +1422,7 @@ class MessageOrchestrator:
 
         chat = update.message.chat
         await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Working...")
+        progress_msg = await update.message.reply_text("🐷 Agent is working…")
 
         # Try enhanced file handler, fall back to basic
         features = context.bot_data.get("features")
@@ -1587,7 +1590,7 @@ class MessageOrchestrator:
 
         chat = update.message.chat
         await chat.send_action("typing")
-        progress_msg = await update.message.reply_text("Working...")
+        progress_msg = await update.message.reply_text("🐷 Agent is working…")
 
         try:
             photo = update.message.photo[-1]
@@ -1665,7 +1668,7 @@ class MessageOrchestrator:
         # Skip the confirm step entirely if disabled by config — useful for
         # users who prefer one-shot voice input.
         if not getattr(self.settings, "voice_confirm_before_send", True):
-            await progress_msg.edit_text("Working…")
+            await progress_msg.edit_text("🐷 Agent is working…")
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,
@@ -1715,7 +1718,7 @@ class MessageOrchestrator:
 
         # Reuse the message as a progress bubble for the Claude turn.
         try:
-            await progress_msg.edit_text("Working…", reply_markup=None)
+            await progress_msg.edit_text("🐷 Agent is working…", reply_markup=None)
         except Exception:  # noqa: BLE001
             pass
         await self._handle_agentic_media_message(

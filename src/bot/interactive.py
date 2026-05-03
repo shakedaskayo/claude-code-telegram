@@ -162,18 +162,20 @@ def build_ask_keyboard(
     prompt_id: str,
     questions: List[Dict[str, Any]],
     selections: Dict[int, _Selection],
+    answers: Optional[Dict[str, Any]] = None,
 ) -> InlineKeyboardMarkup:
     """Render one keyboard for one question (the first unanswered one).
 
     For multi-select questions, options toggle on tap and a final 'Done'
     button submits. For single-select, taps submit immediately.
 
+    ``answers`` is the recorded-answers dict (keyed by question header) from
+    ``tool_input["answers"]``. A question is considered done when its header
+    appears here. ``selections`` only tracks in-progress multi-select state.
+
     Telegram limits inline keyboards: ~3 buttons per row, so we wrap.
     """
-    # Find the first question that isn't fully answered yet. The data layer
-    # tracks answers; if we're called for the first question only, we render
-    # that one and the callback handler will pop it once submitted.
-    qidx = _next_unanswered(questions, selections)
+    qidx = _next_unanswered(questions, answers or {})
     if qidx is None:
         # All answered — defensive empty keyboard.
         return InlineKeyboardMarkup([])
@@ -214,18 +216,18 @@ def build_ask_keyboard(
 
 def _next_unanswered(
     questions: List[Dict[str, Any]],
-    selections: Dict[int, _Selection],
+    answers: Dict[str, Any],
 ) -> Optional[int]:
-    """Index of the first question without a recorded selection. None if all answered."""
+    """Index of the first question whose header isn't in ``answers``.
+
+    Returns None when every question has been recorded as answered (which
+    means the prompt is fully resolved and we can finalize). For multi-select
+    we don't add the header to ``answers`` until Done is tapped.
+    """
     for i, q in enumerate(questions):
-        sel = selections.get(i)
-        if sel is None:
+        header = q.get("header") or f"q{i}"
+        if header not in answers:
             return i
-        # multi-select question with empty selection is still "unanswered"
-        # until the user taps Done — but we encode "done" by removing it from
-        # selections and storing the answer in tool_input["answers"].
-        # That logic lives in the callback handler; here we only need to know
-        # whether to keep prompting.
     return None
 
 
