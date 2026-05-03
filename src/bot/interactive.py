@@ -268,3 +268,39 @@ def _escape(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+# ----------------------------------------------------------------- ExitPlanMode
+
+def render_plan_text(plan: str) -> str:
+    """Format the plan content for Telegram with a header."""
+    body = _escape(plan).strip()
+    if not body:
+        body = "<i>(empty plan)</i>"
+    return (
+        "📋 <b>Proposed Plan</b>\n\n"
+        f"<blockquote expandable>{body}</blockquote>"
+    )
+
+
+def build_plan_keyboard(prompt_id: str) -> InlineKeyboardMarkup:
+    """Three-button keyboard for plan approval.
+
+    callback_data formats:
+      plan:<prompt_id>:approve
+      plan:<prompt_id>:reject
+      plan:<prompt_id>:modify
+    """
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✓ Approve", callback_data=f"plan:{prompt_id}:approve"
+            ),
+            InlineKeyboardButton(
+                "✏ Modify", callback_data=f"plan:{prompt_id}:modify"
+            ),
+            InlineKeyboardButton(
+                "✗ Reject", callback_data=f"plan:{prompt_id}:reject"
+            ),
+        ]
+    ])

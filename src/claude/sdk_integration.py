@@ -207,7 +207,7 @@ def _make_can_use_tool_callback(
     """
     _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
     _BASH_TOOLS = {"Bash", "bash", "shell"}
-    _INTERACTIVE_TOOLS = {"AskUserQuestion"}
+    _INTERACTIVE_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
 
     async def can_use_tool(
         tool_name: str,

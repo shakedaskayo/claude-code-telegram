@@ -215,12 +215,134 @@ def _summary(value: Any) -> str:
     return str(value)
 
 
-# --------------------------------------------------------- plan handler stub
+# --------------------------------------------------------- plan handler
+
+# In-memory: maps user_id -> prompt_id awaiting modify-text reply. The next
+# free-text message from that user is captured as plan feedback rather than a
+# new turn. Cleared on tap.
+_PENDING_MODIFY: Dict[int, str] = {}
+
+
+def get_pending_modify_prompt_id(user_id: int) -> Optional[str]:
+    """If the user has a plan-Modify reply pending, return the prompt id."""
+    return _PENDING_MODIFY.get(user_id)
+
+
+def clear_pending_modify(user_id: int) -> None:
+    _PENDING_MODIFY.pop(user_id, None)
+
+
+async def deliver_plan_modify(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    feedback_text: str,
+) -> bool:
+    """Route a free-text reply from the user to a pending plan-modify prompt.
+
+    Returns True if a pending prompt was found and resolved (caller should
+    suppress the normal 'new turn' processing for this message).
+    """
+    prompt_id = _PENDING_MODIFY.pop(user_id, None)
+    if prompt_id is None:
+        return False
+    registry = get_registry(context)
+    prompt = await registry.pop(prompt_id)
+    if prompt is None or prompt.future.done():
+        return False
+    # Tell Claude: keep the plan, but here is the user's feedback. The SDK
+    # will receive {plan: "<feedback>"} as updated_input and Claude reads it.
+    if not prompt.future.done():
+        prompt.future.set_result({"plan": feedback_text})
+    if prompt.prompt_message is not None:
+        try:
+            await prompt.prompt_message.edit_text(
+                "✏ <b>Plan modified</b>\n\n"
+                f"<i>Your feedback:</i>\n<blockquote>{_short(feedback_text)}</blockquote>",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Failed to edit plan-modify message", error=str(e))
+    return True
+
+
+def _short(s: str, n: int = 600) -> str:
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
 
 async def _handle_plan_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, data: str
 ) -> None:
-    """Wired up by Commit 2."""
+    """Process Approve / Modify / Reject taps for plan mode."""
     cb = update.callback_query
-    if cb is not None:
-        await cb.answer("plan flow not yet wired", show_alert=False)
+    if cb is None:
+        return
+    parts = data.split(":")
+    if len(parts) != 3:
+        await cb.answer("malformed callback")
+        return
+    _, prompt_id, action = parts
+
+    registry = get_registry(context)
+    prompt = await registry.get(prompt_id)
+    if prompt is None or prompt.future.done():
+        await cb.answer("This plan already answered.")
+        return
+    if cb.from_user is None or cb.from_user.id != prompt.user_id:
+        await cb.answer("Not your prompt.")
+        return
+
+    if action == "approve":
+        await registry.pop(prompt_id)
+        if not prompt.future.done():
+            # Pass through the original tool_input — Claude proceeds.
+            prompt.future.set_result(dict(prompt.tool_input))
+        await cb.answer("Approved")
+        if prompt.prompt_message is not None:
+            try:
+                await prompt.prompt_message.edit_reply_markup(reply_markup=None)
+                await prompt.prompt_message.reply_text(
+                    "✓ <b>Plan approved</b> — proceeding.",
+                    parse_mode="HTML",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to ack plan approve", error=str(e))
+        return
+
+    if action == "reject":
+        await registry.pop(prompt_id)
+        if not prompt.future.done():
+            prompt.future.set_result(None)  # → PermissionResultDeny
+        await cb.answer("Rejected")
+        if prompt.prompt_message is not None:
+            try:
+                await prompt.prompt_message.edit_reply_markup(reply_markup=None)
+                await prompt.prompt_message.reply_text(
+                    "✗ <b>Plan rejected</b>.",
+                    parse_mode="HTML",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to ack plan reject", error=str(e))
+        return
+
+    if action == "modify":
+        # Mark this user as awaiting a free-text reply that becomes the
+        # plan-modify feedback. The future stays unresolved until the reply
+        # arrives (or the prompt times out).
+        _PENDING_MODIFY[prompt.user_id] = prompt_id
+        await cb.answer("Reply with your feedback")
+        if prompt.prompt_message is not None:
+            try:
+                await prompt.prompt_message.edit_reply_markup(reply_markup=None)
+                await prompt.prompt_message.reply_text(
+                    "✏ <b>Modify plan</b> — reply to this message with your feedback.\n"
+                    "<i>(or send /cancel to abort)</i>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Failed to ack plan modify", error=str(e))
+        return
+
+    await cb.answer("unknown action")

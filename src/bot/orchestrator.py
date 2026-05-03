@@ -80,6 +80,31 @@ _SECRET_PATTERNS: List[re.Pattern[str]] = [
 ]
 
 
+def _split_for_telegram(text: str, max_len: int = 3800) -> List[str]:
+    """Split a long HTML message into Telegram-safe chunks.
+
+    Telegram caps messages at 4096 characters. We prefer to split on blank
+    lines, then single newlines, then hard cut. Each chunk is small enough
+    that even with a few buttons attached we stay safely under the limit.
+    """
+    if len(text) <= max_len:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        # Try paragraph break first.
+        cut = remaining.rfind("\n\n", 0, max_len)
+        if cut < max_len // 2:
+            cut = remaining.rfind("\n", 0, max_len)
+        if cut < max_len // 2:
+            cut = max_len
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 def _redact_secrets(text: str) -> str:
     """Replace likely secrets/credentials with redacted placeholders."""
     result = text
@@ -739,8 +764,10 @@ class MessageOrchestrator:
         """
         from .interactive import (
             build_ask_keyboard,
+            build_plan_keyboard,
             get_or_create_registry,
             render_ask_text,
+            render_plan_text,
         )
 
         async def handler(tool_name: str, tool_input: Dict[str, Any]) -> Any:
@@ -780,7 +807,42 @@ class MessageOrchestrator:
                 result = await future
                 return result
 
-            # Other interactive tools (EnterPlanMode etc.) land in later commits.
+            if tool_name == "ExitPlanMode":
+                plan_text = tool_input.get("plan") or ""
+                prompt_id, future = await registry.register(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    kind="plan",
+                    tool_input=dict(tool_input),
+                )
+                prompt = await registry.get(prompt_id)
+                if prompt is None:
+                    return None
+                keyboard = build_plan_keyboard(prompt_id)
+                text = render_plan_text(plan_text)
+
+                try:
+                    # Plan can be long — send as multiple messages if needed,
+                    # buttons attached only to the last one so they're visible.
+                    chunks = _split_for_telegram(text)
+                    last_msg = None
+                    for i, chunk in enumerate(chunks):
+                        is_last = i == len(chunks) - 1
+                        markup = keyboard if is_last else None
+                        last_msg = await chat.send_message(
+                            chunk,
+                            parse_mode="HTML",
+                            reply_markup=markup,
+                        )
+                    prompt.prompt_message = last_msg
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to post plan", error=str(e))
+                    await registry.pop(prompt_id)
+                    return None
+
+                result = await future
+                return result
+
             return None
 
         return handler
@@ -1045,6 +1107,21 @@ class MessageOrchestrator:
         """Direct Claude passthrough. Simple progress. No suggestions."""
         user_id = update.effective_user.id
         message_text = update.message.text
+
+        # If the user has a pending plan-Modify reply, route this message there
+        # instead of starting a new Claude turn. /cancel aborts the modify.
+        from .handlers.interactive import (
+            clear_pending_modify,
+            deliver_plan_modify,
+            get_pending_modify_prompt_id,
+        )
+        if get_pending_modify_prompt_id(user_id):
+            if message_text.strip().lower() in ("/cancel", "cancel"):
+                clear_pending_modify(user_id)
+                await update.message.reply_text("Plan modify cancelled.")
+                return
+            if await deliver_plan_modify(context, user_id, message_text):
+                return  # Modify routed; no new turn
 
         logger.info(
             "Agentic text message",
