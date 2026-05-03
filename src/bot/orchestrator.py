@@ -388,6 +388,16 @@ class MessageOrchestrator:
             )
         )
 
+        # Interactive prompts (AskUserQuestion / plan / voice / quick-reply).
+        # All four prefixes share one dispatcher that routes by prefix.
+        from .handlers.interactive import handle_interactive_callback
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(handle_interactive_callback),
+                pattern=r"^(ans|plan|voice|quick):",
+            )
+        )
+
         # Only cd: callbacks (for project selection), scoped by pattern
         app.add_handler(
             CallbackQueryHandler(
@@ -712,6 +722,68 @@ class MessageOrchestrator:
                 pass
 
         return asyncio.create_task(_heartbeat())
+
+    def _make_interactive_handler(
+        self,
+        context: "ContextTypes.DEFAULT_TYPE",
+        user_id: int,
+        chat_id: int,
+        chat: Any,
+    ) -> Callable[[str, Dict[str, Any]], Any]:
+        """Build the SDK-side interactive_handler for this turn.
+
+        The closure is called from claude/sdk_integration.py's can_use_tool
+        when Claude invokes AskUserQuestion (and EnterPlanMode in commit 2).
+        It posts the appropriate Telegram message with inline keyboard
+        buttons, registers a PendingPrompt, and returns the awaited Future.
+        """
+        from .interactive import (
+            build_ask_keyboard,
+            get_or_create_registry,
+            render_ask_text,
+        )
+
+        async def handler(tool_name: str, tool_input: Dict[str, Any]) -> Any:
+            registry = get_or_create_registry(context.bot_data)
+
+            if tool_name == "AskUserQuestion":
+                questions = tool_input.get("questions") or []
+                if not questions:
+                    return {}
+
+                prompt_id, future = await registry.register(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    kind="ask",
+                    tool_input=dict(tool_input),
+                )
+                # Render the first question.
+                text = render_ask_text(questions, 0, {})
+                # Need updated reference to the registered prompt so we can
+                # store the message we send.
+                prompt = await registry.get(prompt_id)
+                if prompt is None:
+                    return {}
+                keyboard = build_ask_keyboard(prompt_id, questions, prompt.selections)
+
+                try:
+                    msg = await chat.send_message(
+                        text, parse_mode="HTML", reply_markup=keyboard
+                    )
+                    prompt.prompt_message = msg
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to post AskUserQuestion", error=str(e))
+                    await registry.pop(prompt_id)
+                    return None
+
+                # Block the SDK call until the user answers (or timeout fires).
+                result = await future
+                return result
+
+            # Other interactive tools (EnterPlanMode etc.) land in later commits.
+            return None
+
+        return handler
 
     @staticmethod
     def _start_progress_heartbeat(
@@ -1070,6 +1142,9 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 interrupt_event=interrupt_event,
+                interactive_handler=self._make_interactive_handler(
+                    context, user_id, chat.id, chat
+                ),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1322,6 +1397,9 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                interactive_handler=self._make_interactive_handler(
+                    context, user_id, chat.id, chat
+                ),
             )
 
             if force_new:
@@ -1534,6 +1612,9 @@ class MessageOrchestrator:
                 on_stream=on_stream,
                 force_new=force_new,
                 images=images,
+                interactive_handler=self._make_interactive_handler(
+                    context, user_id, chat.id, chat
+                ),
             )
         finally:
             heartbeat.cancel()

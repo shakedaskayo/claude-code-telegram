@@ -187,20 +187,50 @@ def _make_can_use_tool_callback(
     security_validator: SecurityValidator,
     working_directory: Path,
     approved_directory: Path,
+    interactive_handler: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
 ) -> Any:
     """Create a can_use_tool callback for SDK-level tool permission validation.
 
     The callback validates file path boundaries and bash directory boundaries
-    *before* the SDK executes the tool, providing preventive security enforcement.
+    *before* the SDK executes the tool, providing preventive security
+    enforcement.
+
+    When ``interactive_handler`` is provided, certain tools are routed through
+    it instead of being auto-allowed: AskUserQuestion (commit 1) and
+    EnterPlanMode (commit 2 — currently still passes through).
+
+    The handler is an async callable receiving ``(tool_name, tool_input)`` and
+    returning either:
+      * ``None`` to deny the tool (treated as ``PermissionResultDeny``)
+      * a ``dict`` to merge into the tool input via ``updated_input`` on
+        ``PermissionResultAllow``
     """
     _FILE_TOOLS = {"Write", "Edit", "Read", "create_file", "edit_file", "read_file"}
     _BASH_TOOLS = {"Bash", "bash", "shell"}
+    _INTERACTIVE_TOOLS = {"AskUserQuestion"}
 
     async def can_use_tool(
         tool_name: str,
         tool_input: Dict[str, Any],
         context: ToolPermissionContext,
     ) -> Any:
+        # Interactive prompts: bridge to the bot's UI layer.
+        if interactive_handler is not None and tool_name in _INTERACTIVE_TOOLS:
+            try:
+                result = await interactive_handler(tool_name, tool_input)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Interactive handler failed; denying tool",
+                    tool_name=tool_name,
+                    error=str(e),
+                )
+                return PermissionResultDeny(message=f"Interactive handler error: {e}")
+            if result is None:
+                return PermissionResultDeny(
+                    message="User declined or prompt timed out"
+                )
+            return PermissionResultAllow(updated_input=result)
+
         # File path validation
         if tool_name in _FILE_TOOLS:
             file_path = tool_input.get("file_path") or tool_input.get("path")
@@ -283,6 +313,7 @@ class ClaudeSDKManager:
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        interactive_handler: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -352,12 +383,15 @@ class ClaudeSDKManager:
                     mcp_config_path=str(self.config.mcp_config_path),
                 )
 
-            # Wire can_use_tool callback for preventive tool validation
-            if self.security_validator:
+            # Wire can_use_tool callback for preventive tool validation. The
+            # interactive_handler bridges to the bot's UI when Claude calls
+            # AskUserQuestion (commit 1) or EnterPlanMode (commit 2).
+            if self.security_validator or interactive_handler is not None:
                 options.can_use_tool = _make_can_use_tool_callback(
                     security_validator=self.security_validator,
                     working_directory=working_directory,
                     approved_directory=self.config.approved_directory,
+                    interactive_handler=interactive_handler,
                 )
 
             # Resume previous session if we have a session_id
