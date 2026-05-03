@@ -150,8 +150,15 @@ def _validate_config(settings: Settings) -> None:
     if settings.rate_limit_window <= 0:
         raise InvalidConfigError("rate_limit_window must be positive")
 
-    if settings.claude_timeout_seconds <= 0:
-        raise InvalidConfigError("claude_timeout_seconds must be positive")
+    # 0 is allowed and means "no hard timeout, rely on the inactivity guard".
+    # Negative values are still rejected.
+    if settings.claude_timeout_seconds < 0:
+        raise InvalidConfigError("claude_timeout_seconds must be >= 0 (0 = unlimited)")
+
+    if settings.claude_inactivity_timeout_s <= 0:
+        raise InvalidConfigError("claude_inactivity_timeout_s must be positive")
+    if settings.claude_inactivity_check_interval_s <= 0:
+        raise InvalidConfigError("claude_inactivity_check_interval_s must be positive")
 
     # Validate cost limits
     if settings.claude_max_cost_per_user <= 0:

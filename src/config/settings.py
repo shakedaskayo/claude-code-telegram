@@ -16,6 +16,8 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.utils.constants import (
+    DEFAULT_CLAUDE_INACTIVITY_CHECK_INTERVAL_S,
+    DEFAULT_CLAUDE_INACTIVITY_TIMEOUT_S,
     DEFAULT_CLAUDE_MAX_COST_PER_REQUEST,
     DEFAULT_CLAUDE_MAX_COST_PER_USER,
     DEFAULT_CLAUDE_MAX_TURNS,
@@ -85,7 +87,24 @@ class Settings(BaseSettings):
         DEFAULT_CLAUDE_MAX_TURNS, description="Max conversation turns"
     )
     claude_timeout_seconds: int = Field(
-        DEFAULT_CLAUDE_TIMEOUT_SECONDS, description="Claude timeout"
+        DEFAULT_CLAUDE_TIMEOUT_SECONDS,
+        description=(
+            "Hard timeout in seconds for a single Claude turn. 0 disables the hard "
+            "wall and relies entirely on the inactivity guard (recommended for long "
+            "tasks)."
+        ),
+    )
+    claude_inactivity_timeout_s: int = Field(
+        DEFAULT_CLAUDE_INACTIVITY_TIMEOUT_S,
+        description=(
+            "If no stream event is received from the Claude SDK for this many "
+            "seconds, the turn is considered stuck and is interrupted. This is "
+            "the real liveness check; the hard wall above is just a safety net."
+        ),
+    )
+    claude_inactivity_check_interval_s: int = Field(
+        DEFAULT_CLAUDE_INACTIVITY_CHECK_INTERVAL_S,
+        description="How often (seconds) the inactivity watcher polls.",
     )
     claude_max_cost_per_user: float = Field(
         DEFAULT_CLAUDE_MAX_COST_PER_USER, description="Max cost per user"

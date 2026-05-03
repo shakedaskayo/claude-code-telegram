@@ -5,7 +5,13 @@ APP_NAME = "Claude Code Telegram Bot"
 APP_DESCRIPTION = "Telegram bot for remote Claude Code access"
 
 # Default limits
-DEFAULT_CLAUDE_TIMEOUT_SECONDS = 300
+# 0 = no hard wall; rely on inactivity guard instead. The hard wall used to be
+# 300s and was the source of timeouts on legitimate long-running tasks.
+DEFAULT_CLAUDE_TIMEOUT_SECONDS = 0
+# Inactivity guard: if no stream events arrive for this long, the SDK call is
+# considered stuck and is interrupted. This is the real safety net.
+DEFAULT_CLAUDE_INACTIVITY_TIMEOUT_S = 300
+DEFAULT_CLAUDE_INACTIVITY_CHECK_INTERVAL_S = 30
 DEFAULT_CLAUDE_MAX_TURNS = 10
 DEFAULT_CLAUDE_MAX_COST_PER_USER = 10.0
 DEFAULT_CLAUDE_MAX_COST_PER_REQUEST = 5.0

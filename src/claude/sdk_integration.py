@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -365,6 +366,13 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
             interrupted = False
+            # Wall-clock timestamp of the last stream event. Single-element list so
+            # the inner _run_client closure can mutate it. The inactivity watcher
+            # reads this to decide whether the SDK call is still making progress.
+            last_event_at: List[float] = [time.monotonic()]
+            # Flipped by the inactivity watcher when it kills the run. Distinguishes
+            # "user pressed Stop" from "got stuck and timed out".
+            inactivity_killed = [False]
 
             async def _run_client() -> None:
                 client = ClaudeSDKClient(options)
@@ -413,6 +421,9 @@ class ClaudeSDKManager:
                             continue
 
                         messages.append(message)
+                        # Record liveness for the inactivity watcher. We mark every
+                        # parsed event so internal SDK chatter still counts as alive.
+                        last_event_at[0] = time.monotonic()
 
                         if isinstance(message, ResultMessage):
                             break
@@ -457,6 +468,10 @@ class ClaudeSDKManager:
                     )
                     await asyncio.sleep(delay)
 
+                # Reset the liveness clock for each retry attempt.
+                last_event_at[0] = time.monotonic()
+                inactivity_killed[0] = False
+
                 run_task = asyncio.create_task(_run_client())
 
                 interrupt_watcher: Optional["asyncio.Task[None]"] = None
@@ -470,23 +485,73 @@ class ClaudeSDKManager:
 
                     interrupt_watcher = asyncio.create_task(_cancel_on_interrupt())
 
-                # Note: asyncio.TimeoutError is intentionally NOT retried —
-                # it reflects a user-configured hard limit.
+                # Inactivity guard: if no stream events arrive for inactivity_timeout_s,
+                # assume the SDK call is stuck and cancel run_task. This is the real
+                # liveness check; claude_timeout_seconds (the hard wall) is just a
+                # safety net and may be 0 to disable.
+                inactivity_timeout = self.config.claude_inactivity_timeout_s
+                inactivity_check = self.config.claude_inactivity_check_interval_s
+
+                async def _inactivity_watcher() -> None:
+                    while not run_task.done():
+                        await asyncio.sleep(inactivity_check)
+                        if run_task.done():
+                            return
+                        idle = time.monotonic() - last_event_at[0]
+                        if idle >= inactivity_timeout:
+                            inactivity_killed[0] = True
+                            logger.warning(
+                                "Claude SDK inactive — cancelling run",
+                                idle_seconds=int(idle),
+                                inactivity_timeout_s=inactivity_timeout,
+                            )
+                            run_task.cancel()
+                            return
+
+                inactivity_task = asyncio.create_task(_inactivity_watcher())
+
+                # The hard wall: 0 means "no hard timeout, rely on inactivity guard".
+                # Anything > 0 still serves as a final ceiling, but is no longer
+                # the primary liveness mechanism.
+                hard_timeout = self.config.claude_timeout_seconds or None
+
+                # Note: asyncio.TimeoutError is intentionally NOT retried — both
+                # the hard wall and inactivity-induced cancellation reflect "this
+                # turn isn't going to finish". Re-running the same prompt would
+                # likely hit the same wall.
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(run_task),
-                        timeout=self.config.claude_timeout_seconds,
-                    )
+                    if hard_timeout is None:
+                        # No hard wall: just await the run. The inactivity watcher
+                        # will cancel it via run_task.cancel() if needed, surfacing
+                        # as CancelledError below.
+                        await asyncio.shield(run_task)
+                    else:
+                        await asyncio.wait_for(
+                            asyncio.shield(run_task),
+                            timeout=hard_timeout,
+                        )
                     break  # success — exit retry loop
                 except asyncio.CancelledError:
-                    if not interrupted:
-                        raise
-                    # Interrupt cancelled the task — wait for cleanup
-                    try:
-                        await run_task
-                    except asyncio.CancelledError:
-                        pass
-                    break  # user interrupted — don't retry
+                    if interrupted:
+                        # User pressed Stop. Wait for the SDK to clean up.
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
+                        break  # user interrupted — don't retry
+                    if inactivity_killed[0]:
+                        # Inactivity watcher pulled the plug. Surface as a timeout
+                        # so existing error handling treats it identically to the
+                        # old hard-wall behavior.
+                        try:
+                            await run_task
+                        except asyncio.CancelledError:
+                            pass
+                        raise asyncio.TimeoutError(
+                            f"Claude SDK had no events for "
+                            f"{self.config.claude_inactivity_timeout_s}s"
+                        )
+                    raise
                 except asyncio.TimeoutError:
                     run_task.cancel()
                     try:
@@ -507,6 +572,7 @@ class ClaudeSDKManager:
                 finally:
                     if interrupt_watcher is not None:
                         interrupt_watcher.cancel()
+                    inactivity_task.cancel()
             else:
                 if last_exc is not None:
                     raise last_exc
