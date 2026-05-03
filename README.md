@@ -1,7 +1,86 @@
-# Claude Code Telegram Bot
+# Claude Code Telegram Bot — `shakedaskayo` fork
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Branch: shaked-runtime-fixes](https://img.shields.io/badge/branch-shaked--runtime--fixes-orange.svg)](https://github.com/shakedaskayo/claude-code-telegram/tree/shaked-runtime-fixes)
+
+> ⚠️ **This is a personal fork of [RichardAtCT/claude-code-telegram](https://github.com/RichardAtCT/claude-code-telegram).** All upstream credit goes to Richard. This branch (`shaked-runtime-fixes`) adds runtime fixes and interactive features. Use the upstream repo for the canonical version.
+
+## What's different in this fork
+
+These commits sit on top of upstream `v1.6.0`:
+
+### Runtime fixes
+- **Inactivity-based liveness** instead of a hard 600s wall — long Claude turns complete as long as they're streaming progress.
+- **Per-chat asyncio locks** — long task in chat A no longer blocks chat B.
+- **Streaming coalescing** — Telegram edits throttled to ~0.4s, with a heartbeat that ticks the elapsed counter even when Claude is silent.
+- **Start-of-turn session persistence** — session rows appear in storage as soon as Claude assigns an id, not at end-of-turn.
+
+### Interactive features
+- **`AskUserQuestion` → inline keyboard.** When Claude asks a clarifying question via the SDK's tool, the bot renders one button per option in Telegram. Multi-select supported with toggle + Done.
+- **Plan mode → approve / modify / reject buttons.** When Claude exits plan mode the bot intercepts the plan, posts it, and waits for your tap before executing. **Modify** opens a free-text reply that goes back as plan feedback.
+- **Voice → echo confirm.** Voice memos are transcribed (via local `whisper.cpp` by default), shown back as "I heard X" with [Send] [Edit] [Cancel] buttons. **Edit** opens a free-text reply that replaces the transcript before sending.
+- **Quick-reply shortcuts.** When Claude ends with a yes/no question, the bot attaches [Yes] [No] [Tell me more] buttons. Tap = reply.
+
+### Live progress UI
+- **Pig-styled progress bubble.** Replaces the plain "Working… (Ns)" with: 🤖 heading, blockquoted running prose (token-streamed), tool ribbon with `⚙ pending` / `✓ ok` / `❌ fail` icons, and an `⏱ Ns · 🔧 N tools · 💤 idle Ns` footer that ticks every ~4s.
+
+## Install from this fork
+
+```bash
+pip install --force-reinstall \
+  "git+https://github.com/shakedaskayo/claude-code-telegram@shaked-runtime-fixes-v1"
+```
+
+Or install in an isolated env via `uv`:
+```bash
+uv tool install \
+  "git+https://github.com/shakedaskayo/claude-code-telegram@shaked-runtime-fixes-v1"
+```
+
+The original installation/configuration steps from the upstream README all
+still apply — see the original Quick Start below.
+
+### Voice setup (optional)
+
+Voice confirmation needs `whisper.cpp` on your `PATH`. On macOS:
+```bash
+brew install whisper-cpp
+mkdir -p ~/.cache/whisper-cpp
+curl -L \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin \
+  -o ~/.cache/whisper-cpp/ggml-base.bin
+```
+
+Then in your `.env`:
+```
+ENABLE_VOICE_MESSAGES=true
+VOICE_PROVIDER=local
+WHISPER_CPP_MODEL_PATH=base
+VOICE_CONFIRM_BEFORE_SEND=true
+```
+
+### New environment variables
+
+```
+# Inactivity-based timeouts (replace the old hard wall)
+CLAUDE_TIMEOUT_SECONDS=0          # 0 = no hard wall
+CLAUDE_INACTIVITY_TIMEOUT_S=300   # kill if no events for 5min
+CLAUDE_INACTIVITY_CHECK_INTERVAL_S=30
+
+# Streaming pacing
+STREAM_FLUSH_INTERVAL_S=0.4       # min seconds between Telegram edits
+
+# Interactive
+VOICE_CONFIRM_BEFORE_SEND=true    # echo transcripts before sending
+```
+
+### Branch / tag
+
+- Branch: [`shaked-runtime-fixes`](https://github.com/shakedaskayo/claude-code-telegram/tree/shaked-runtime-fixes)
+- Floating tag: `shaked-runtime-fixes-v1` (force-pushed as commits land)
+
+---
 
 A Telegram bot that gives you remote access to [Claude Code](https://claude.ai/code). Chat naturally with Claude about your projects from anywhere -- no terminal commands needed.
 
