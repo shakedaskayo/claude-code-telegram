@@ -189,6 +189,34 @@ class Storage:
 
         return session
 
+    async def ensure_session_placeholder(
+        self, user_id: int, project_path: str, session_id: str
+    ) -> bool:
+        """Persist a session row at start-of-turn so the dashboard can show
+        in-flight conversations.
+
+        Idempotent: subsequent calls with the same session_id are a no-op. The
+        regular update_session() flow at the end of the turn will fill in cost,
+        turns, and message_count; we just guarantee the row exists early.
+
+        Returns True if a new placeholder was inserted; False if a row already
+        existed (which is fine and expected on every event after the first).
+        """
+        session = SessionModel(
+            session_id=session_id,
+            user_id=user_id,
+            project_path=project_path,
+            created_at=datetime.now(UTC),
+            last_used=datetime.now(UTC),
+        )
+        inserted = await self.sessions.ensure_session(session)
+        if inserted:
+            user = await self.users.get_user(user_id)
+            if user:
+                user.session_count += 1
+                await self.users.update_user(user)
+        return inserted
+
     async def log_security_event(
         self,
         user_id: int,

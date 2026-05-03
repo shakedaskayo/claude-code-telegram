@@ -157,6 +157,39 @@ class SessionRepository:
             )
             return session
 
+    async def ensure_session(self, session: SessionModel) -> bool:
+        """Insert a session row if it does not already exist.
+
+        Used by the start-of-turn placeholder path so a single Claude turn can
+        call this on every stream event without duplicate-row errors. Returns
+        True if a new row was inserted, False if it already existed.
+        """
+        async with self.db.get_connection() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions
+                (session_id, user_id, project_path, created_at, last_used,
+                 total_cost, total_turns, message_count, is_active)
+                VALUES (?, ?, ?, ?, ?, 0.0, 0, 0, 1)
+                """,
+                (
+                    session.session_id,
+                    session.user_id,
+                    session.project_path,
+                    session.created_at,
+                    session.last_used,
+                ),
+            )
+            await conn.commit()
+            inserted = (cursor.rowcount or 0) > 0
+            if inserted:
+                logger.info(
+                    "Ensured session (new placeholder)",
+                    session_id=session.session_id,
+                    user_id=session.user_id,
+                )
+            return inserted
+
     async def update_session(self, session: SessionModel):
         """Update session data."""
         async with self.db.get_connection() as conn:

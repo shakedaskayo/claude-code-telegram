@@ -370,6 +370,13 @@ async def handle_text_message(
             parse_mode="HTML",
         )
 
+        # Track whether we've persisted the start-of-turn placeholder yet.
+        # Once we get a session_id from the SDK we write a placeholder row to
+        # storage so the dashboard can list this conversation while it's still
+        # in flight. Idempotent at the storage layer, but we still gate here
+        # to avoid an extra DB call per event.
+        placeholder_persisted: dict = {"done": False}
+
         # Enhanced stream updates handler with progress tracking
         async def stream_handler(update_obj):
             # Intercept send_image_to_user MCP tool calls.
@@ -388,6 +395,24 @@ async def handle_text_message(
                         )
                         if img:
                             mcp_images.append(img)
+
+            # Persist a session placeholder as soon as Claude assigns the id.
+            sdk_sid = getattr(update_obj, "session_id", None)
+            if sdk_sid and not placeholder_persisted["done"] and storage:
+                placeholder_persisted["done"] = True
+                try:
+                    await storage.ensure_session_placeholder(
+                        user_id=user_id,
+                        project_path=str(current_dir),
+                        session_id=sdk_sid,
+                    )
+                except Exception as e:
+                    # Non-fatal: the regular end-of-turn save will still run.
+                    logger.warning(
+                        "Failed to persist session placeholder",
+                        error=str(e),
+                        session_id=sdk_sid,
+                    )
 
             try:
                 progress_text = await _format_progress_update(update_obj)

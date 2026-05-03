@@ -71,6 +71,11 @@ class StreamUpdate:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
     progress: Optional[Dict[str, Any]] = None
+    # Session id assigned by the Claude SDK. Populated from the first SDK message
+    # that carries one, then on every subsequent event. Lets the bot persist a
+    # session row at start-of-turn so the dashboard can show in-flight work
+    # rather than waiting for the turn to complete.
+    session_id: Optional[str] = None
 
     def get_tool_names(self) -> List[str]:
         """Return tool names from the stream payload."""
@@ -753,6 +758,16 @@ class ClaudeSDKManager:
         self, message: Message, stream_callback: Callable[[StreamUpdate], None]
     ) -> None:
         """Handle streaming message from claude-agent-sdk."""
+        # Best-effort extract: every SDK message carries a session_id once Claude
+        # has decided one. We attach it to every StreamUpdate so consumers can
+        # persist start-of-turn state without waiting for ResultMessage.
+        msg_session_id = getattr(message, "session_id", None)
+
+        async def _emit(update: StreamUpdate) -> None:
+            if msg_session_id and update.session_id is None:
+                update.session_id = msg_session_id
+            await stream_callback(update)
+
         try:
             if isinstance(message, AssistantMessage):
                 # Extract content from assistant message
@@ -781,14 +796,14 @@ class ClaudeSDKManager:
                         content=("\n".join(text_parts) if text_parts else None),
                         tool_calls=tool_calls if tool_calls else None,
                     )
-                    await stream_callback(update)
+                    await _emit(update)
                 elif content:
                     # Fallback for non-list content
                     update = StreamUpdate(
                         type="assistant",
                         content=str(content),
                     )
-                    await stream_callback(update)
+                    await _emit(update)
 
             elif isinstance(message, StreamEvent):
                 event = message.event or {}
@@ -801,7 +816,7 @@ class ClaudeSDKManager:
                                 type="stream_delta",
                                 content=text,
                             )
-                            await stream_callback(update)
+                            await _emit(update)
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
@@ -810,7 +825,7 @@ class ClaudeSDKManager:
                         type="user",
                         content=content,
                     )
-                    await stream_callback(update)
+                    await _emit(update)
 
         except Exception as e:
             logger.warning("Stream callback failed", error=str(e))
