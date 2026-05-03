@@ -908,6 +908,25 @@ class MessageOrchestrator:
         trackers = context.bot_data.get("task_trackers", {})
         tracker = trackers.get(tracker_user_id)
 
+        if action == "expand":
+            await cb.answer()
+            if tracker is not None:
+                try:
+                    await tracker.toggle_expanded()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Expand toggle failed", error=str(e))
+            return
+
+        if action == "end":
+            await cb.answer("Session ended")
+            if tracker is not None:
+                try:
+                    await tracker.end_session(success=True)
+                    trackers.pop(tracker_user_id, None)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("End session failed", error=str(e))
+            return
+
         if action == "queue":
             from .task_tracker import mark_queue_pending
             mark_queue_pending(tracker_user_id)
@@ -1327,12 +1346,12 @@ class MessageOrchestrator:
 
         # Create Stop button and interrupt event
         interrupt_event = asyncio.Event()
+        # Stop button lives on the pinned session tracker, not here. The
+        # progress bubble is content-only (streaming prose + tools).
         stop_kb = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
         )
-        progress_msg = await update.message.reply_text(
-            "🐷 Agent is working…", reply_markup=stop_kb
-        )
+        progress_msg = await update.message.reply_text("…")
 
         # Register active request for stop callback
         active_request = ActiveRequest(
@@ -1376,19 +1395,31 @@ class MessageOrchestrator:
                 throttle_interval=self.settings.stream_draft_interval,
             )
 
-        # Pinned 'Active Task' tracker — survives long pauses, has actions.
-        from .task_tracker import TaskTracker
+        # Pinned session tracker — ONE per Claude session, surviving any
+        # number of follow-up iterations within that session. We look up an
+        # existing tracker for this user; if none, create one (start of a
+        # fresh session). Each new message increments the iteration counter.
+        from .task_tracker import SessionTracker
         from .utils.todo_renderer import TodoTracker
 
         workspace_name = current_dir.name if hasattr(current_dir, "name") else None
-        tracker = TaskTracker(
-            chat=chat,
-            user_id=user_id,
-            workspace=workspace_name,
-            interrupt_event=interrupt_event,
-        )
-        await tracker.start()
-        context.bot_data.setdefault("task_trackers", {})[user_id] = tracker
+        trackers_map = context.bot_data.setdefault("task_trackers", {})
+        tracker = trackers_map.get(user_id)
+        if tracker is None or tracker.state in ("completed", "failed"):
+            tracker = SessionTracker(
+                chat=chat,
+                user_id=user_id,
+                workspace=workspace_name,
+                interrupt_event=interrupt_event,
+            )
+            await tracker.start()
+            trackers_map[user_id] = tracker
+        else:
+            # Existing session: hand the new turn its interrupt_event so
+            # [Stop] taps cancel the right run.
+            tracker.interrupt_event = interrupt_event
+        # Begin a new iteration for this turn.
+        await tracker.begin_iteration(message_text)
 
         # Per-turn TodoWrite renderer — created lazily when Claude first uses it.
         todo_tracker = TodoTracker(chat=chat)
@@ -1398,7 +1429,7 @@ class MessageOrchestrator:
             progress_msg,
             tool_log,
             start_time,
-            reply_markup=stop_kb,
+            reply_markup=None,  # Buttons live on the pinned tracker now.
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
@@ -1876,15 +1907,32 @@ class MessageOrchestrator:
             )
             transcript = processed_voice.prompt or ""
         except Exception as e:
-            from .handlers.message import _format_error_message
-            await progress_msg.edit_text(_format_error_message(e), parse_mode="HTML")
+            # Show a short, user-friendly message in chat; full diagnostics
+            # go to the structured log. Avoid dumping stack-trace style errors
+            # to the user — voice failures are usually setup issues.
+            err_str = str(e)
+            if "whisper" in err_str.lower() or "binary" in err_str.lower():
+                msg = (
+                    "🎤 <b>Voice transcription unavailable</b>\n\n"
+                    "<i>Local Whisper isn't fully set up. Send your message "
+                    "as text for now, or ask the bot owner to install "
+                    "whisper-cpp.</i>"
+                )
+            elif "size" in err_str.lower() or "too large" in err_str.lower():
+                msg = "🎤 <i>Voice message too large; please record a shorter clip.</i>"
+            else:
+                msg = "🎤 <i>Couldn't transcribe — please try again or send as text.</i>"
+            try:
+                await progress_msg.edit_text(msg, parse_mode="HTML")
+            except Exception:  # noqa: BLE001
+                pass
             logger.error(
-                "Voice transcription failed", error=str(e), user_id=user_id
+                "Voice transcription failed", error=err_str, user_id=user_id
             )
             return
 
         if not transcript.strip():
-            await progress_msg.edit_text("🎤 (couldn't make out any speech)")
+            await progress_msg.edit_text("🎤 <i>(couldn't make out any speech)</i>", parse_mode="HTML")
             return
 
         # Skip the confirm step entirely if disabled by config — useful for

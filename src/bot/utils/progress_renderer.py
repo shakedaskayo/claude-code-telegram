@@ -149,12 +149,10 @@ class ProgressRenderer:
         body = self._final_text if self._final_text is not None else self._running_text
         body = body.strip()
 
-        # Nothing useful to show yet — but DO render an early heartbeat so the
-        # user sees something the moment the bot acknowledges them.
+        # Nothing useful to show yet — return None so the throttler doesn't
+        # post a placeholder. The pinned session tracker is already showing
+        # 'iteration N · running' so the user knows the bot received them.
         if not body and not self._tools and not self._error and not self._init_label:
-            elapsed = self.elapsed_seconds()
-            if elapsed >= 1:
-                return f"⏳ <i>Starting up… ({_fmt_dur(elapsed)})</i>"
             return None
 
         lines: list[str] = []
@@ -168,15 +166,15 @@ class ProgressRenderer:
         if self._init_label:
             lines.append(f"<i>{escape_html(self._init_label)}</i>")
 
+        # The pinned session tracker already owns the "what state am I in"
+        # signal (running/idle/awaiting + elapsed + buttons). The per-turn
+        # progress bubble's job is just to show streamed prose + tool ribbon
+        # — no redundant 'Agent is working…' headline, no footer.
         if body:
-            lines.append("🐷 <b>Agent is working…</b>")
-            lines.append("")
             shown = body[-_TEXT_BUDGET:]
             if len(body) > _TEXT_BUDGET:
                 shown = "…" + shown
             lines.append(f"<blockquote>{escape_html(shown)}</blockquote>")
-        elif self._tools:
-            lines.append("🔧 <b>Using tools…</b>")
 
         if self._tools:
             ribbon_parts: list[str] = []
@@ -210,17 +208,8 @@ class ProgressRenderer:
             lines.append("")
             lines.append("<i>Recent:</i> " + " · ".join(ribbon_parts))
 
-        # Footer line: elapsed time + total tools. Always present so the user
-        # has a clear "still alive" signal that ticks every refresh.
-        elapsed = self.elapsed_seconds()
-        idle = self.idle_seconds()
-        footer_bits = [f"⏱ {_fmt_dur(elapsed)}"]
-        if self._total_tools:
-            footer_bits.append(f"🔧 {self._total_tools} tools")
-        if idle >= 4:
-            footer_bits.append(f"💤 idle {_fmt_dur(idle)}")
-        lines.append("")
-        lines.append(f"<i>{' · '.join(footer_bits)}</i>")
+        # Footer dropped — pinned session tracker shows elapsed/tools/state.
+        # Keeping it here would duplicate that info in two places per iteration.
 
         return "\n".join(lines)
 

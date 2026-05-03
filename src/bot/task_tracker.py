@@ -1,113 +1,132 @@
-"""Pinned 'Active Task' status message lifecycle.
+"""Pinned 'Active Session' tracker.
 
-The bot maintains one pinned message per turn so the user always knows what's
-happening — even when they scroll up, even when typing indicators die, even
-when the progress bubble is far below.
+ONE pinned message per Claude session (from /new to /new), surviving any
+number of iterations (turns). Iterations are added to the same pinned
+message — it doesn't reset on each follow-up.
 
 State machine:
-    running   → Claude is actively producing events (≤30s since last)
+    running   → an iteration is producing events (≤30s since last)
     stalled   → no events for >30s; heartbeat still firing
     awaiting  → AskUserQuestion or ExitPlanMode pending
-    paused    → user tapped Pause (not currently exposed via button; future)
-    completed → turn finished cleanly; auto-unpin in 30s
-    failed    → turn errored; stays pinned until acknowledged
+    idle      → between iterations; user hasn't sent next prompt yet
+    completed → session ended cleanly (user sent /end or /new)
+    failed    → fatal error in last iteration
 
-Only state transitions edit the pinned message. The body shows a small,
-glanceable summary; tap [Status] to get a verbose detail message.
-
-Pinning notifies once at start; edits don't notify. We unpin on completion.
+Pinning notifies once at start; edits don't notify; we unpin only when
+the session completes/ends.
 """
 from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Deque, Dict, Optional
 
 import structlog
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = structlog.get_logger()
 
-State = str  # "running" | "stalled" | "awaiting" | "paused" | "completed" | "failed"
+State = str  # "running" | "stalled" | "awaiting" | "idle" | "completed" | "failed"
 
-# Auto-unpin completed tasks after this delay so the chat isn't cluttered
-# with old "✓ Done" pins. Failed tasks stay pinned until the user starts a
-# new one (we'll unpin then).
-_AUTO_UNPIN_DELAY_S = 30
+# How many recent iterations to keep visible in the expanded view.
+_RECENT_ITERATIONS = 6
 
 
 @dataclass
-class TaskTracker:
-    """One per turn. Owns the pinned status message + lifecycle."""
+class _Iteration:
+    """One Claude turn within a session."""
+
+    index: int
+    prompt_preview: str
+    started_at: float
+    ended_at: Optional[float] = None
+    state: str = "running"  # "running" | "completed" | "failed"
+    tools: int = 0
+    cost: float = 0.0
+
+
+@dataclass
+class SessionTracker:
+    """One per Claude session. Lives across iterations."""
 
     chat: Any
     user_id: int
     workspace: Optional[str] = None
     started_at: float = field(default_factory=time.monotonic)
-    state: State = "running"
-    last_event_at: float = field(default_factory=time.monotonic)
+    state: State = "idle"
     detail: str = ""
-    tool_count: int = 0
+    total_tools: int = 0
+    total_cost: float = 0.0
+    iterations: Deque[_Iteration] = field(default_factory=lambda: deque(maxlen=_RECENT_ITERATIONS))
+    expanded: bool = False  # whether to render the verbose iteration list
     pinned: bool = False
-    message: Any = None  # the pinned (or fallback) telegram Message
-
-    # Set by the orchestrator after construction so action buttons can talk
-    # back to the running turn.
+    message: Any = None  # the pinned telegram Message
+    last_event_at: float = field(default_factory=time.monotonic)
     interrupt_event: Optional[asyncio.Event] = None
 
+    @property
+    def iteration_count(self) -> int:
+        """All-time count, even past the deque maxlen."""
+        return getattr(self, "_iteration_count", 0)
+
+    @iteration_count.setter
+    def iteration_count(self, value: int) -> None:
+        self._iteration_count = value
+
+    @property
+    def current_iteration(self) -> Optional[_Iteration]:
+        return self.iterations[-1] if self.iterations else None
+
+    # --- lifecycle --------------------------------------------------------
+
     async def start(self) -> None:
-        """Post the initial status message and try to pin it."""
+        """Post + pin the initial session message."""
+        self._iteration_count = 0
         text = self._render()
         try:
             self.message = await self.chat.send_message(
-                text,
-                parse_mode="HTML",
-                reply_markup=self._keyboard(),
+                text, parse_mode="HTML", reply_markup=self._keyboard()
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to post task tracker", error=str(e))
+            logger.warning("Failed to post session tracker", error=str(e))
             return
-        # Pin best-effort. In private chats we usually have can_pin_messages.
         try:
             await self.chat.pin_message(
                 self.message.message_id, disable_notification=False
             )
             self.pinned = True
         except Exception as e:  # noqa: BLE001
-            # Permissions or transient — fall back to the unpinned 'sticky' feel.
             logger.debug("Pin failed, continuing unpinned", error=str(e))
+
+    async def begin_iteration(self, prompt: str) -> None:
+        """A new turn (follow-up message) is starting."""
+        self._iteration_count = self.iteration_count + 1
+        it = _Iteration(
+            index=self._iteration_count,
+            prompt_preview=_shorten(prompt, 80),
+            started_at=time.monotonic(),
+        )
+        self.iterations.append(it)
+        self.state = "running"
+        self.detail = ""
+        self.last_event_at = time.monotonic()
+        await self._refresh()
 
     async def transition(
         self,
         new_state: State,
         *,
         detail: Optional[str] = None,
-        tool_count: Optional[int] = None,
         send_notification: bool = False,
     ) -> None:
-        """Move to a new state and refresh the pinned message."""
-        if new_state == self.state and detail is None and tool_count is None:
-            return  # no-op
+        """Update state without ending the iteration."""
         self.state = new_state
         if detail is not None:
             self.detail = detail
-        if tool_count is not None:
-            self.tool_count = tool_count
         self.last_event_at = time.monotonic()
-
-        if self.message is not None:
-            try:
-                await self.message.edit_text(
-                    self._render(),
-                    parse_mode="HTML",
-                    reply_markup=self._keyboard(),
-                )
-            except Exception as e:  # noqa: BLE001 - never let UI crash the turn
-                logger.debug("Tracker edit skipped", error=str(e))
-
-        # Awaiting-input is the one transition we always notify about, since
-        # it means the agent literally cannot continue without the user.
+        await self._refresh()
         if send_notification and new_state == "awaiting":
             try:
                 await self.chat.send_message(
@@ -117,97 +136,158 @@ class TaskTracker:
             except Exception as e:  # noqa: BLE001
                 logger.debug("Awaiting notification failed", error=str(e))
 
-    async def heartbeat_tick(self) -> None:
-        """Called periodically by the orchestrator's progress heartbeat.
+    async def end_iteration(
+        self, *, success: bool, tools: int = 0, cost: float = 0.0
+    ) -> None:
+        """Mark the current iteration done. Session stays alive."""
+        it = self.current_iteration
+        if it is not None:
+            it.ended_at = time.monotonic()
+            it.state = "completed" if success else "failed"
+            it.tools = tools
+            it.cost = cost
+        self.total_tools += tools
+        self.total_cost += cost
+        self.state = "idle"  # waiting for next user message
+        self.detail = ""
+        await self._refresh()
 
-        Detects 'stalled' (no events for 30s while running) and edits the
-        pinned message so the user sees the elapsed counter advance.
+    async def end_session(self, *, success: bool = True) -> None:
+        """Retire the pin. Called on /new or /end."""
+        self.state = "completed" if success else "failed"
+        await self._refresh(no_keyboard=True)
+        if self.pinned and self.message is not None:
+            try:
+                await self.chat.unpin_message(self.message.message_id)
+                self.pinned = False
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Unpin failed", error=str(e))
+
+    async def finish(self, success: bool, summary: Optional[str] = None) -> None:
+        """Backwards-compatible alias: end the current iteration cleanly.
+
+        The orchestrator's existing finally-block calls finish(success=...)
+        once per Claude turn. With the per-session model, that's the end of
+        an iteration, not the whole session. The session itself stays alive
+        until the user sends /new or taps [End session].
         """
-        if self.state in ("completed", "failed"):
+        if summary is not None and not self.detail:
+            self.detail = summary
+        await self.end_iteration(success=success)
+
+    async def heartbeat_tick(self) -> None:
+        """Detect running → stalled and refresh elapsed."""
+        if self.state in ("completed", "failed", "idle"):
             return
         idle = time.monotonic() - self.last_event_at
         if self.state == "running" and idle > 30:
-            await self.transition("stalled")
-            return
-        # Just refresh the elapsed counter.
-        if self.message is not None:
-            try:
-                await self.message.edit_text(
-                    self._render(),
-                    parse_mode="HTML",
-                    reply_markup=self._keyboard(),
-                )
-            except Exception:  # noqa: BLE001
-                pass  # noise: 'message is not modified' / rate limits
+            self.state = "stalled"
+        await self._refresh()
 
-    async def finish(self, success: bool, summary: Optional[str] = None) -> None:
-        """Mark the task done and arrange for auto-unpin."""
-        self.state = "completed" if success else "failed"
-        if summary:
-            self.detail = summary
-        if self.message is not None:
-            try:
-                await self.message.edit_text(
-                    self._render(),
-                    parse_mode="HTML",
-                    reply_markup=None,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Finish edit skipped", error=str(e))
-        # Successful tasks auto-unpin after a delay; failed ones stay pinned.
-        if success and self.pinned:
-            asyncio.create_task(self._auto_unpin())
+    def bump_tools(self, n: int = 1) -> None:
+        it = self.current_iteration
+        if it is not None:
+            it.tools += n
+        self.total_tools += n
+        self.last_event_at = time.monotonic()
 
-    async def _auto_unpin(self) -> None:
-        try:
-            await asyncio.sleep(_AUTO_UNPIN_DELAY_S)
-            if self.message is not None:
-                await self.chat.unpin_message(self.message.message_id)
-                self.pinned = False
-        except Exception as e:  # noqa: BLE001
-            logger.debug("Auto-unpin failed", error=str(e))
+    def bump_event(self) -> None:
+        """Mark that an event happened (used to keep stalled away)."""
+        self.last_event_at = time.monotonic()
+
+    async def toggle_expanded(self) -> None:
+        self.expanded = not self.expanded
+        await self._refresh()
 
     # --- rendering --------------------------------------------------------
 
+    async def _refresh(self, no_keyboard: bool = False) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit_text(
+                self._render(),
+                parse_mode="HTML",
+                reply_markup=None if no_keyboard else self._keyboard(),
+            )
+        except Exception:  # noqa: BLE001
+            pass  # 'not modified' / rate-limit noise
+
     def _render(self) -> str:
-        elapsed = int(time.monotonic() - self.started_at)
         emoji = _STATE_EMOJI.get(self.state, "•")
-        state_label = self.state
+        elapsed = int(time.monotonic() - self.started_at)
         ws = self.workspace or "—"
 
-        lines = [
-            f"📌 <b>Active Task</b> — {_escape(ws)}",
-            f"{emoji} <i>{state_label}</i> · ⏱ {_fmt_dur(elapsed)}"
-            + (f" · 🔧 {self.tool_count} tools" if self.tool_count else ""),
-        ]
-        if self.detail:
-            lines.append(f"<i>{_escape(self.detail[:140])}</i>")
+        header = f"📌 <b>{_escape(ws)}</b> · session {_fmt_dur(elapsed)}"
+        line2_parts = [f"{emoji} <i>{self.state}</i>"]
+        if self._iteration_count:
+            line2_parts.append(f"iteration {self._iteration_count}")
+        if self.total_tools:
+            line2_parts.append(f"🔧 {self.total_tools} tools")
+        if self.total_cost > 0:
+            line2_parts.append(f"💸 ${self.total_cost:.2f}")
+        line2 = " · ".join(line2_parts)
+
+        lines = [header, line2]
+
+        # If currently working on something, show it.
+        if self.detail and self.state in ("running", "stalled", "awaiting"):
+            lines.append("")
+            lines.append(f"<i>Now:</i> {_escape(self.detail[:140])}")
+
+        # Expanded iteration list — opt-in via the [Show iterations] toggle.
+        if self.expanded and self.iterations:
+            lines.append("")
+            lines.append("<i>Recent iterations:</i>")
+            for it in self.iterations:
+                its = _ITER_EMOJI.get(it.state, "•")
+                dur = _fmt_dur(int((it.ended_at or time.monotonic()) - it.started_at))
+                lines.append(
+                    f"  {its} #{it.index} · {dur} · {it.tools}t — "
+                    f"<i>{_escape(it.prompt_preview)}</i>"
+                )
+
         return "\n".join(lines)
 
     def _keyboard(self) -> Optional[InlineKeyboardMarkup]:
         if self.state in ("completed", "failed"):
             return None
-        # callback_data fits within Telegram's 64-byte limit easily.
-        return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "■ Stop", callback_data=f"stop:{self.user_id}"
-                ),
-                InlineKeyboardButton(
-                    "📥 Queue", callback_data=f"trk:queue:{self.user_id}"
-                ),
-                InlineKeyboardButton(
-                    "ℹ Status", callback_data=f"trk:status:{self.user_id}"
-                ),
-            ]
+        # Compose the action row. We keep it tight (3 buttons) plus an
+        # expand toggle on a second row when there's something to expand.
+        rows = []
+        active = self.state in ("running", "stalled", "awaiting")
+        action_row = []
+        if active:
+            action_row.append(
+                InlineKeyboardButton("■ Stop", callback_data=f"stop:{self.user_id}")
+            )
+        action_row.append(
+            InlineKeyboardButton("📥 Queue", callback_data=f"trk:queue:{self.user_id}")
+        )
+        action_row.append(
+            InlineKeyboardButton("ℹ Status", callback_data=f"trk:status:{self.user_id}")
+        )
+        rows.append(action_row)
+        toggle_label = "▴ Hide iterations" if self.expanded else "▾ Show iterations"
+        rows.append([
+            InlineKeyboardButton(toggle_label, callback_data=f"trk:expand:{self.user_id}"),
+            InlineKeyboardButton(
+                "✕ End session", callback_data=f"trk:end:{self.user_id}"
+            ),
         ])
+        return InlineKeyboardMarkup(rows)
 
 
 _STATE_EMOJI: Dict[str, str] = {
     "running": "🟢",
     "stalled": "🟡",
     "awaiting": "🔵",
-    "paused": "⏸",
+    "idle": "⚪",
+    "completed": "✓",
+    "failed": "❌",
+}
+_ITER_EMOJI: Dict[str, str] = {
+    "running": "🟢",
     "completed": "✓",
     "failed": "❌",
 }
@@ -231,13 +311,16 @@ def _escape(text: str) -> str:
     )
 
 
+def _shorten(text: str, n: int) -> str:
+    text = (text or "").replace("\n", " ").strip()
+    if len(text) <= n:
+        return text
+    return text[: n - 1] + "…"
+
+
 # ============================================================ Queued prompts
 
-# In-memory store: user_id -> {"text": str, "delivered_at": float}.
-# When a turn finishes, the orchestrator drains this for the user and posts
-# the queued text as if they'd just sent it.
 _QUEUED: Dict[int, Dict[str, Any]] = {}
-# user_id -> True while awaiting their next text after tapping [Queue].
 _AWAITING_QUEUE_TEXT: Dict[int, bool] = {}
 
 
@@ -263,3 +346,10 @@ def take_queued_prompt(user_id: int) -> Optional[str]:
     if item is None:
         return None
     return item.get("text")
+
+
+# ============================================================ TaskTracker compat
+
+# Some older code paths import TaskTracker from this module. Keep an alias so
+# callers don't break while the rename is in flight.
+TaskTracker = SessionTracker
