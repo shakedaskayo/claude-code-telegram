@@ -24,6 +24,7 @@ from claude_agent_sdk import (
     TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
@@ -854,7 +855,35 @@ class ClaudeSDKManager:
 
             elif isinstance(message, UserMessage):
                 content = getattr(message, "content", "")
-                if content:
+                # The SDK packs ToolResultBlocks inside UserMessage.content as
+                # a list of blocks. Surface each one as its own StreamUpdate
+                # so the renderer can pair tool calls with their results
+                # (line counts, exit codes, etc.).
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, ToolResultBlock):
+                            result_text: Optional[str] = None
+                            block_content = getattr(block, "content", None)
+                            if isinstance(block_content, str):
+                                result_text = block_content
+                            elif isinstance(block_content, list):
+                                # Concatenate text-typed sub-blocks.
+                                parts: List[str] = []
+                                for sub in block_content:
+                                    if isinstance(sub, dict) and sub.get("type") == "text":
+                                        parts.append(str(sub.get("text", "")))
+                                if parts:
+                                    result_text = "\n".join(parts)
+                            update = StreamUpdate(
+                                type="tool_result",
+                                content=result_text,
+                                metadata={
+                                    "tool_use_id": getattr(block, "tool_use_id", None),
+                                    "is_error": bool(getattr(block, "is_error", False)),
+                                },
+                            )
+                            await _emit(update)
+                elif content:
                     update = StreamUpdate(
                         type="user",
                         content=content,

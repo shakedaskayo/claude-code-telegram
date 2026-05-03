@@ -63,13 +63,25 @@ class StreamThrottler:
         self._flush_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
-    async def update(self, text: str) -> None:
-        """Record a new latest text and trigger a (possibly delayed) flush."""
+    async def update(self, text: str, *, urgent: bool = False) -> None:
+        """Record a new latest text and trigger a (possibly delayed) flush.
+
+        ``urgent=True`` bypasses the throttle interval and sends now. Use it
+        for low-frequency, high-information events (e.g. tool start/finish)
+        that shouldn't queue behind a prose burst.
+        """
         if not text:
             return
         async with self._lock:
             self._pending_text = text
-            self._schedule_flush_locked()
+            if urgent:
+                # Cancel any pending delayed flush and send right away.
+                if self._flush_task is not None and not self._flush_task.done():
+                    self._flush_task.cancel()
+                    self._flush_task = None
+                await self._send_if_changed_locked()
+            else:
+                self._schedule_flush_locked()
 
     async def flush(self) -> None:
         """Force the latest pending text through immediately, bypassing throttle.

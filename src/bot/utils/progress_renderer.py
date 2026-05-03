@@ -44,13 +44,14 @@ _RIBBON_KEEP = 6
 class _ToolEntry:
     """One tool invocation tracked for the activity ribbon."""
 
-    __slots__ = ("name", "summary", "status", "tool_use_id")
+    __slots__ = ("name", "summary", "status", "tool_use_id", "result_summary")
 
     def __init__(self, name: str, summary: str, tool_use_id: Optional[str]) -> None:
         self.name = name
         self.summary = summary
         self.status = "pending"  # pending | ok | fail
         self.tool_use_id = tool_use_id
+        self.result_summary: Optional[str] = None
 
 
 class ProgressRenderer:
@@ -127,11 +128,12 @@ class ProgressRenderer:
         elif t == "tool_result":
             md = getattr(update_obj, "metadata", None) or {}
             tool_use_id = md.get("tool_use_id")
-            is_error = bool(getattr(update_obj, "is_error", lambda: False)())
+            is_error = bool(md.get("is_error"))
             new_status = "fail" if is_error else "ok"
-            # Mark the matching ribbon entry, or the most recent pending one
-            # if we can't match by id.
-            self._mark_tool_result(tool_use_id, new_status)
+            result_text = getattr(update_obj, "content", None) or ""
+            # Mark the matching ribbon entry and attach a short summary
+            # extracted from the result text (line counts, exit codes, etc.).
+            self._mark_tool_result(tool_use_id, new_status, result_text)
 
         elif t == "error":
             try:
@@ -179,8 +181,9 @@ class ProgressRenderer:
         if self._tools:
             ribbon_parts: list[str] = []
             # Coalesce consecutive identical entries (same icon+name+summary)
-            # into "label ×N" so the ribbon doesn't read "Edit foo · Edit foo"
-            # when Claude makes several quick edits to the same file.
+            # into "label ×N". Result summaries (line counts, exit codes)
+            # render after the input summary to give an at-a-glance sense of
+            # what the tool actually did.
             run_label: Optional[str] = None
             run_count = 0
             for entry in self._tools:
@@ -188,6 +191,8 @@ class ProgressRenderer:
                 label = entry.name
                 if entry.summary:
                     label = f"{label}<code> {escape_html(entry.summary)}</code>"
+                if entry.result_summary:
+                    label = f"{label} <i>{escape_html(entry.result_summary)}</i>"
                 full = f"{icon} {label}"
                 if full == run_label:
                     run_count += 1
@@ -233,17 +238,28 @@ class ProgressRenderer:
     def _status_icon(status: str) -> str:
         return {"ok": "✓", "fail": "❌", "pending": "⚙"}.get(status, "•")
 
-    def _mark_tool_result(self, tool_use_id: Optional[str], new_status: str) -> None:
+    def _mark_tool_result(
+        self,
+        tool_use_id: Optional[str],
+        new_status: str,
+        result_text: str = "",
+    ) -> None:
+        target: Optional[_ToolEntry] = None
         if tool_use_id:
             for entry in reversed(self._tools):
                 if entry.tool_use_id == tool_use_id:
-                    entry.status = new_status
-                    return
-        # Fallback: mark the most recent pending entry.
-        for entry in reversed(self._tools):
-            if entry.status == "pending":
-                entry.status = new_status
-                return
+                    target = entry
+                    break
+        if target is None:
+            # Fallback: mark the most recent pending entry.
+            for entry in reversed(self._tools):
+                if entry.status == "pending":
+                    target = entry
+                    break
+        if target is None:
+            return
+        target.status = new_status
+        target.result_summary = _extract_result_summary(target.name, result_text)
 
     @staticmethod
     def _summarize_tool_input(name: str, raw: Any) -> str:
@@ -286,3 +302,75 @@ def _fmt_dur(seconds: int) -> str:
         return f"{seconds // 60}m {seconds % 60}s"
     h, rem = divmod(seconds, 3600)
     return f"{h}h {rem // 60}m"
+
+
+def _extract_result_summary(tool_name: str, result_text: str) -> Optional[str]:
+    """Extract a short stat from a tool's result content.
+
+    Per-tool rules:
+      Edit/Write/MultiEdit: parse "+N -N" if present, else None
+      Read: count visible lines in the response
+      Bash: extract exit code if present in output
+      Glob/Grep: count matches (lines or 'N matches' phrasing)
+      WebFetch: byte size
+    Returns None when nothing useful can be derived.
+    """
+    if not result_text:
+        return None
+    text = result_text.strip()
+
+    if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        # Look for the SDK's standard '+N -N' style or count lines we can see.
+        m = _PLUS_MINUS.search(text)
+        if m:
+            return m.group(0)
+        # Sometimes the result is just the new content.
+        line_count = text.count("\n") + 1
+        if line_count > 0 and line_count < 10000:
+            return f"{line_count} ln"
+        return None
+
+    if tool_name in ("Read", "NotebookRead"):
+        # The CLI prefixes lines with "  N→" when reading files. Count those.
+        line_match_count = sum(
+            1 for ln in text.splitlines() if _LINE_PREFIX.match(ln)
+        )
+        if line_match_count:
+            return f"{line_match_count} ln"
+        # Fallback: raw line count (for non-file Reads).
+        return f"{text.count(chr(10)) + 1} ln"
+
+    if tool_name == "Bash":
+        # CLI doesn't always include exit code; look for "exit code N".
+        m = _EXIT_CODE.search(text)
+        if m:
+            return f"exit {m.group(1)}"
+        # Heuristic: error-looking output → "errored"
+        return None
+
+    if tool_name in ("Glob", "Grep"):
+        # The SDK formats result as "Found N matches" or just lists results.
+        m = _MATCHES.search(text)
+        if m:
+            return f"{m.group(1)} match"
+        # Otherwise count non-empty lines as a proxy.
+        n = sum(1 for ln in text.splitlines() if ln.strip())
+        if n:
+            return f"{n} match"
+        return None
+
+    if tool_name in ("WebFetch", "WebSearch"):
+        size = len(text)
+        if size > 1024:
+            return f"{size // 1024} KB"
+        return f"{size}B"
+
+    return None
+
+
+# Regex helpers for result-summary extraction.
+import re  # noqa: E402 (module-level constants near use site)
+_PLUS_MINUS = re.compile(r"\+\d+\s+-\d+")
+_LINE_PREFIX = re.compile(r"^\s*\d+→")
+_EXIT_CODE = re.compile(r"exit\s+code[:\s]+(-?\d+)", re.IGNORECASE)
+_MATCHES = re.compile(r"(\d+)\s+match", re.IGNORECASE)

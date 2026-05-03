@@ -1000,13 +1000,18 @@ class MessageOrchestrator:
 
             # Feed the renderer regardless of draft_streamer so the in-flight
             # progress message gets the rich treatment. The renderer is
-            # idempotent and handles every event type.
+            # idempotent. Tool events are 'urgent' — they bypass the throttle
+            # interval so the user sees them snap into place instead of
+            # queuing behind a stream_delta burst.
             if not draft_streamer and verbose_level >= 1:
                 try:
                     renderer.feed(update_obj)
                     text = renderer.render()
                     if text:
-                        await throttler.update(text)
+                        urgent = update_obj.type in ("tool_result", "system") or (
+                            update_obj.type == "assistant" and update_obj.tool_calls
+                        )
+                        await throttler.update(text, urgent=urgent)
                 except Exception as render_err:  # noqa: BLE001
                     logger.debug(
                         "Progress render skipped",
